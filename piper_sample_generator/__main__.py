@@ -21,6 +21,8 @@ try:
 except ImportError:
     from piper_train.vits import commons
 
+from .variations import generate_wakeword_variations
+
 _LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
@@ -595,6 +597,11 @@ def main() -> int:
     parser.add_argument(
         "--phoneme-input", action="store_true", help="Treat input text as phoneme input"
     )
+    parser.add_argument(
+        "--generate-variations",
+        action="store_true",
+        help="Generate positive/negative phonetic variations (wake word training)",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args().__dict__
 
@@ -605,6 +612,47 @@ def main() -> int:
     if any(mp for mp in model_paths[1:] if mp.suffix != model_paths[0].suffix):
         _LOGGER.error("All models must have the same suffix (.pt or .onnx)")
         return 1
+
+    # Handle wake word variation generation
+    if args.get("generate_variations"):
+        _LOGGER.info(f"Generating phonetic variations for: {args['text']}")
+        try:
+            positive, negative = generate_wakeword_variations(args["text"])
+            _LOGGER.info(f"Generated {len(positive)} positive + {len(negative)} negative variations")
+
+            # Generate TTS for positive variations
+            output_base = Path(args["output_dir"])
+            positive_dir = output_base / "positive"
+            negative_dir = output_base / "negative"
+
+            original_max_samples = args["max_samples"]
+            total_variations = len(positive) + len(negative)
+
+            args["output_dir"] = str(positive_dir)
+            args["max_samples"] = int(original_max_samples * len(positive) / total_variations) or len(positive)
+            args["text"] = positive
+
+            if model_paths[0].suffix == ".onnx":
+                generate_samples_onnx(**args)
+            elif model_paths[0].suffix == ".pt":
+                args["model"] = args["model"][0]
+                generate_samples(**args)
+
+            # Generate TTS for negative variations
+            args["output_dir"] = str(negative_dir)
+            args["max_samples"] = int(original_max_samples * len(negative) / total_variations) or len(negative)
+            args["text"] = negative
+
+            if model_paths[0].suffix == ".onnx":
+                generate_samples_onnx(**args)
+            elif model_paths[0].suffix == ".pt":
+                generate_samples(**args)
+
+            _LOGGER.info(f"✓ Variation dataset saved to: {output_base}")
+            return 0
+        except ValueError as e:
+            _LOGGER.error(f"Error generating variations: {e}")
+            return 1
 
     if model_paths[0].suffix == ".onnx":
         # Use Piper voice (.onnx)
