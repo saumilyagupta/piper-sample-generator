@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from train_wakeword import WakeWordMLP
+from piper_sample_generator.train import WakeWordMLP
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)

@@ -21,6 +21,8 @@ try:
 except ImportError:
     from piper_train.vits import commons
 
+from .augment import augment_directory
+from .train import train_model
 from .variations import generate_wakeword_variations
 
 _LOGGER = logging.getLogger(__name__)
@@ -602,8 +604,31 @@ def main() -> int:
         action="store_true",
         help="Generate positive/negative phonetic variations (wake word training)",
     )
+    parser.add_argument(
+        "--train-model",
+        action="store_true",
+        help="After generating variations, augment audio and train a wake word "
+        "detector model (implies --generate-variations)",
+    )
+    parser.add_argument(
+        "--model-output",
+        default="wakeword_model.pkl",
+        help="Output path for trained wake word model (default: wakeword_model.pkl)",
+    )
+    parser.add_argument(
+        "--train-epochs", type=int, default=100, help="Max training epochs"
+    )
+    parser.add_argument(
+        "--train-patience",
+        type=int,
+        default=15,
+        help="Early stopping patience in epochs (best val-loss checkpoint is kept)",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args().__dict__
+
+    if args.get("train_model"):
+        args["generate_variations"] = True
 
     # Generate speech
     model_paths = [Path(m) for m in args["model"]]
@@ -649,6 +674,29 @@ def main() -> int:
                 generate_samples(**args)
 
             _LOGGER.info(f"✓ Variation dataset saved to: {output_base}")
+
+            if not args.get("train_model"):
+                return 0
+
+            # Augment + train wake word detector directly from generated dataset
+            positive_aug_dir = output_base / "positive_aug"
+            negative_aug_dir = output_base / "negative_aug"
+
+            _LOGGER.info("Augmenting positive samples...")
+            augment_directory(positive_dir, positive_aug_dir, sample_rate=16000)
+
+            _LOGGER.info("Augmenting negative samples...")
+            augment_directory(negative_dir, negative_aug_dir, sample_rate=16000)
+
+            _LOGGER.info("Training wake word detector...")
+            train_model(
+                positive_aug_dir,
+                negative_aug_dir,
+                output_model=args["model_output"],
+                epochs=args["train_epochs"],
+                patience=args["train_patience"],
+            )
+            _LOGGER.info(f"✓ Trained model saved to: {args['model_output']}")
             return 0
         except ValueError as e:
             _LOGGER.error(f"Error generating variations: {e}")

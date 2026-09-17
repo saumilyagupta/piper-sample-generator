@@ -3,6 +3,7 @@ import argparse
 import audioop
 import wave
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 from audiomentations import ApplyImpulseResponse, Compose, Gain
@@ -10,13 +11,10 @@ from audiomentations import ApplyImpulseResponse, Compose, Gain
 _DIR = Path(__file__).parent
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_dir")
-    parser.add_argument("output_dir")
-    parser.add_argument("--sample-rate", type=int, required=True)
-    args = parser.parse_args()
-
+def augment_directory(
+    input_dir: Union[str, Path], output_dir: Union[str, Path], sample_rate: int
+) -> None:
+    """Apply volume + impulse response augmentation to all WAVs in input_dir."""
     impulses = list((_DIR / "impulses").glob("*.wav"))
 
     augment = Compose(
@@ -26,8 +24,8 @@ def main() -> None:
         ]
     )
 
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for input_wav in input_dir.glob("*.wav"):
@@ -52,26 +50,32 @@ def main() -> None:
             output_audio = augment(
                 input_audio, sample_rate=input_wav_file.getframerate()
             )
-            output_wav_file.setframerate(
-                args.sample_rate or input_wav_file.getframerate()
-            )
+            output_wav_file.setframerate(sample_rate or input_wav_file.getframerate())
             output_wav_file.setsampwidth(2)
             output_wav_file.setnchannels(1)
 
             output_audio_16 = audio_float_to_int16(output_audio)
-            if args.sample_rate != input_wav_file.getframerate():
+            if sample_rate != input_wav_file.getframerate():
                 output_audio_16, _state = audioop.ratecv(
                     output_audio_16,
                     2,
                     1,
                     input_wav_file.getframerate(),
-                    args.sample_rate,
+                    sample_rate,
                     None,
                 )
 
             output_wav_file.writeframes(output_audio_16)
 
-        print(output_wav)
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_dir")
+    parser.add_argument("output_dir")
+    parser.add_argument("--sample-rate", type=int, required=True)
+    args = parser.parse_args()
+
+    augment_directory(args.input_dir, args.output_dir, args.sample_rate)
 
 
 def audio_float_to_int16(
