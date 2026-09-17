@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test trained wake word detector."""
+"""Test trained wake word detector (MLP + best val-loss checkpoint)."""
 
 import argparse
 import logging
@@ -8,37 +8,56 @@ from pathlib import Path
 
 import librosa
 import numpy as np
+import torch
+import torch.nn.functional as F
+
+from train_wakeword import WakeWordMLP
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
 
 
+def extract_mfcc_features(wav_path: str, n_mfcc: int, max_frames: int) -> np.ndarray:
+    """Extract fixed-length MFCC features matching training preprocessing."""
+    y, sr = librosa.load(wav_path, sr=16000)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+
+    if mfcc.shape[1] < max_frames:
+        mfcc = np.pad(mfcc, ((0, 0), (0, max_frames - mfcc.shape[1])), mode="constant")
+    else:
+        mfcc = mfcc[:, :max_frames]
+
+    return mfcc.flatten()
+
+
 def predict(model_file: str, audio_file: str) -> dict:
     """Predict if audio contains wake word."""
-    # Load model
     with open(model_file, "rb") as f:
         data = pickle.load(f)
-        clf = data["model"]
-        n_mfcc = data["n_mfcc"]
 
-    # Extract features
+    model = WakeWordMLP(input_dim=data["input_dim"])
+    model.load_state_dict(data["model_state_dict"])
+    model.eval()
+
     try:
-        y, sr = librosa.load(audio_file, sr=16000)
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-        features = mfcc.flatten()
+        features = extract_mfcc_features(audio_file, data["n_mfcc"], data["max_frames"])
     except Exception as e:
         _LOGGER.error(f"Error loading audio: {e}")
         return None
 
-    # Predict
-    pred = clf.predict([features])[0]
-    prob = clf.predict_proba([features])[0]
+    features = data["scaler"].transform([features])
+    x = torch.tensor(features, dtype=torch.float32)
+
+    with torch.no_grad():
+        logits = model(x)
+        probs = F.softmax(logits, dim=1)[0]
+        pred = int(torch.argmax(probs).item())
 
     return {
         "prediction": "POSITIVE (Wake word detected)" if pred == 1 else "NEGATIVE (No wake word)",
-        "confidence_negative": prob[0],
-        "confidence_positive": prob[1],
-        "label": int(pred),
+        "confidence_negative": probs[0].item(),
+        "confidence_positive": probs[1].item(),
+        "label": pred,
     }
 
 
