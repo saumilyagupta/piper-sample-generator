@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wake Word Monitor</title>
+<style>
+  :root {
+    --bg: oklch(18% 0.015 260);
+    --panel: oklch(23% 0.018 260);
+    --panel-hi: oklch(28% 0.02 260);
+    --line: oklch(34% 0.02 260);
+    --text: oklch(93% 0.005 260);
+    --muted: oklch(66% 0.015 260);
+    --idle: oklch(70% 0.03 260);
+    --live: oklch(78% 0.15 200);
+    --hit: oklch(78% 0.19 150);
+    --miss: oklch(74% 0.12 70);
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+    --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: clamp(1.5rem, 1rem + 3vw, 4rem) 16px;
+    min-height: 100vh;
+    background:
+      radial-gradient(ellipse 80% 50% at 50% -10%, oklch(30% 0.05 220 / 0.5), transparent 70%),
+      var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    justify-content: center;
+  }
+
+  .shell { width: 100%; max-width: 560px; }
+
+  header { margin-bottom: 2rem; }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(1.6rem, 1.2rem + 1.6vw, 2.2rem);
+    font-weight: 620;
+    letter-spacing: -0.02em;
+  }
+
+  .sub {
+    margin: 0.4rem 0 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+    font-family: var(--mono);
+  }
+
+  .panel {
+    background: linear-gradient(var(--panel-hi), var(--panel));
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 1.25rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 1px 0 oklch(100% 0 0 / 0.04) inset, 0 12px 28px oklch(0% 0 0 / 0.35);
+  }
+
+  label {
+    display: block;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--muted);
+    margin-bottom: 0.55rem;
+  }
+
+  select, button {
+    font: inherit;
+    width: 100%;
+    padding: 0.7rem 0.85rem;
+    border-radius: 9px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--text);
+    transition: border-color 160ms var(--ease), background 160ms var(--ease), transform 120ms var(--ease);
+  }
+
+  select:hover, select:focus-visible { border-color: var(--live); outline: none; }
+
+  button {
+    margin-top: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    background: var(--live);
+    border-color: transparent;
+    color: oklch(18% 0.04 220);
+  }
+
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.stop { background: var(--miss); color: oklch(20% 0.05 70); }
+
+  /* Status readout — the focal element */
+  .readout {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    align-items: center;
+    gap: 1rem;
+    padding: 1.6rem 1.35rem;
+  }
+
+  .dot {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: var(--idle);
+    box-shadow: 0 0 0 0 currentColor;
+    transition: background 200ms var(--ease);
+  }
+
+  .readout[data-state="listening"] .dot { background: var(--live); animation: pulse 1.6s infinite; }
+  .readout[data-state="detected"]  .dot { background: var(--hit); }
+  .readout[data-state="rejected"]  .dot { background: var(--miss); }
+
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 oklch(78% 0.15 200 / 0.55); }
+    70%  { box-shadow: 0 0 0 12px oklch(78% 0.15 200 / 0); }
+    100% { box-shadow: 0 0 0 0 oklch(78% 0.15 200 / 0); }
+  }
+
+  .verdict {
+    font-size: clamp(1.35rem, 1rem + 1.8vw, 1.9rem);
+    font-weight: 660;
+    letter-spacing: -0.015em;
+    line-height: 1.15;
+  }
+
+  .readout[data-state="detected"] .verdict { color: var(--hit); }
+  .readout[data-state="rejected"] .verdict { color: var(--miss); }
+  .readout[data-state="idle"] .verdict,
+  .readout[data-state="listening"] .verdict { color: var(--text); }
+
+  .verdict-note {
+    margin-top: 0.25rem;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+
+  /* Meters */
+  .meter-row { margin-top: 1.1rem; }
+  .meter-row:first-child { margin-top: 0; }
+
+  .meter-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 0.4rem;
+  }
+
+  .meter-head span:last-child {
+    font-family: var(--mono);
+    font-size: 0.92rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .track {
+    position: relative;
+    height: 8px;
+    border-radius: 99px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    overflow: hidden;
+  }
+
+  .fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 99px;
+    background: var(--live);
+    transition: width 140ms linear, background 200ms var(--ease);
+  }
+
+  .fill.hit { background: var(--hit); }
+  .fill.level { background: var(--muted); }
+
+  .threshold {
+    position: absolute;
+    top: -3px; bottom: -3px;
+    width: 2px;
+    background: var(--text);
+    opacity: 0.55;
+  }
+
+  .legend {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-top: 0.35rem;
+  }
+
+  .err {
+    color: var(--miss);
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    margin-top: 0.75rem;
+    min-height: 1.2em;
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <h1>Wake Word Monitor</h1>
+    <p class="sub" id="modelInfo">loading config…</p>
+  </header>
+
+  <div class="panel readout" id="readout" data-state="idle">
+    <div class="dot"></div>
+    <div>
+      <div class="verdict" id="verdict">Idle</div>
+      <div class="verdict-note" id="verdictNote">select a microphone to begin</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="meter-row">
+      <div class="meter-head">
+        <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted)">Confidence</span>
+        <span id="confVal">0.000</span>
+      </div>
+      <div class="track">
+        <div class="fill" id="confFill"></div>
+        <div class="threshold" id="threshMark"></div>
+      </div>
+      <div class="legend"><span>0.0</span><span id="threshLabel">threshold</span><span>1.0</span></div>
+    </div>
+
+    <div class="meter-row">
+      <div class="meter-head">
+        <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted)">Input level</span>
+        <span id="peakVal">0.000</span>
+      </div>
+      <div class="track"><div class="fill level" id="peakFill"></div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <label for="micSelect">Microphone</label>
+    <select id="micSelect"><option>requesting permission…</option></select>
+    <button id="toggleBtn" disabled>Start listening</button>
+    <div class="err" id="err"></div>
+  </div>
+
+</div>
+
+<script>
+const els = {
+  mic: document.getElementById('micSelect'),
+  btn: document.getElementById('toggleBtn'),
+  err: document.getElementById('err'),
+  readout: document.getElementById('readout'),
+  verdict: document.getElementById('verdict'),
+  note: document.getElementById('verdictNote'),
+  confVal: document.getElementById('confVal'),
+  confFill: document.getElementById('confFill'),
+  peakVal: document.getElementById('peakVal'),
+  peakFill: document.getElementById('peakFill'),
+  threshMark: document.getElementById('threshMark'),
+  threshLabel: document.getElementById('threshLabel'),
+  modelInfo: document.getElementById('modelInfo'),
+};
+
+let cfg = { sample_rate: 16000, window_seconds: 1.5, threshold: 0.5 };
+let running = false;
+let ws = null, audioCtx = null, stream = null, processor = null, source = null;
+let pending = [];          // accumulated 16kHz samples awaiting send
+let samplesPerSend = 8000; // ~0.5s at 16kHz
+
+async function init() {
+  try {
+    cfg = await (await fetch('/config')).json();
+  } catch (e) { /* defaults are fine */ }
+
+  samplesPerSend = Math.round(cfg.sample_rate * 0.5);
+  els.threshMark.style.left = (cfg.threshold * 100) + '%';
+  els.threshLabel.textContent = 'thr ' + cfg.threshold.toFixed(2);
+  els.modelInfo.textContent =
+    `${cfg.sample_rate} Hz · ${cfg.window_seconds}s window · threshold ${cfg.threshold}`;
+
+  await listMics();
+}
+
+async function listMics() {
+  try {
+    // Permission first, otherwise device labels come back empty.
+    const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+    probe.getTracks().forEach(t => t.stop());
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter(d => d.kind === 'audioinput');
+
+    els.mic.innerHTML = '';
+    inputs.forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `Microphone ${i + 1}`;
+      els.mic.appendChild(opt);
+    });
+
+    els.btn.disabled = inputs.length === 0;
+    if (!inputs.length) setErr('No audio input devices found.');
+  } catch (e) {
+    els.mic.innerHTML = '<option>permission denied</option>';
+    setErr('Microphone permission denied: ' + e.message);
+  }
+}
+
+function setErr(msg) { els.err.textContent = msg || ''; }
+
+function setState(state, verdict, note) {
+  els.readout.dataset.state = state;
+  els.verdict.textContent = verdict;
+  els.note.textContent = note;
+}
+
+/** Linear-resample a Float32Array from inRate to outRate. */
+function resample(input, inRate, outRate) {
+  if (inRate === outRate) return input;
+  const ratio = inRate / outRate;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const idx = Math.floor(pos);
+    const frac = pos - idx;
+    const a = input[idx];
+    const b = input[idx + 1] !== undefined ? input[idx + 1] : a;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+async function start() {
+  setErr('');
+  try {
+    const deviceId = els.mic.value;
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: deviceId ? { exact: deviceId } : undefined }
+    });
+
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      const c = msg.confidence ?? 0;
+      const p = msg.peak ?? 0;
+
+      els.confVal.textContent = c.toFixed(3);
+      els.confFill.style.width = (c * 100).toFixed(1) + '%';
+      els.confFill.classList.toggle('hit', msg.status === 'detected');
+
+      els.peakVal.textContent = p.toFixed(3);
+      els.peakFill.style.width = Math.min(100, p * 200).toFixed(1) + '%';
+
+      if (msg.status === 'detected') {
+        setState('detected', 'DETECTED', `confidence ${c.toFixed(3)} ≥ ${cfg.threshold}`);
+      } else if (msg.status === 'rejected') {
+        setState('rejected', 'Rejected', `confidence ${c.toFixed(3)} < ${cfg.threshold}`);
+      } else {
+        setState('listening', 'Listening…', 'no audio above noise floor');
+      }
+    };
+
+    ws.onerror = () => setErr('WebSocket error — is the server still running?');
+    ws.onclose = () => { if (running) stop(); };
+
+    await new Promise((res, rej) => {
+      ws.onopen = res;
+      setTimeout(() => rej(new Error('WebSocket connection timed out')), 5000);
+    });
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(stream);
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = (e) => {
+      if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const chunk = resample(e.inputBuffer.getChannelData(0), audioCtx.sampleRate, cfg.sample_rate);
+      pending.push(...chunk);
+
+      if (pending.length >= samplesPerSend) {
+        ws.send(new Float32Array(pending.splice(0, samplesPerSend)).buffer);
+      }
+    };
+
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    running = true;
+    els.btn.textContent = 'Stop listening';
+    els.btn.classList.add('stop');
+    els.mic.disabled = true;
+    setState('listening', 'Listening…', 'say the wake word');
+  } catch (e) {
+    setErr(e.message);
+    stop();
+  }
+}
+
+function stop() {
+  running = false;
+  pending = [];
+
+  if (processor) { processor.disconnect(); processor.onaudioprocess = null; processor = null; }
+  if (source) { source.disconnect(); source = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+
+  els.btn.textContent = 'Start listening';
+  els.btn.classList.remove('stop');
+  els.mic.disabled = false;
+  els.confFill.style.width = '0%';
+  els.peakFill.style.width = '0%';
+  setState('idle', 'Idle', 'stopped');
+}
+
+els.btn.addEventListener('click', () => running ? stop() : start());
+init();
+</script>
+</body>
+</html>

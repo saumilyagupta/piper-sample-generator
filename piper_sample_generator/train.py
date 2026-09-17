@@ -20,18 +20,39 @@ N_MFCC = 13
 MAX_FRAMES = 100
 
 
+def mfcc_from_audio(
+    audio: np.ndarray, n_mfcc: int = N_MFCC, max_frames: int = MAX_FRAMES
+) -> np.ndarray:
+    """Extract fixed-length MFCC features from a 16kHz float32 waveform."""
+    mfcc = librosa.feature.mfcc(y=audio, sr=16000, n_mfcc=n_mfcc)
+
+    if mfcc.shape[1] < max_frames:
+        mfcc = np.pad(mfcc, ((0, 0), (0, max_frames - mfcc.shape[1])), mode="constant")
+    else:
+        mfcc = mfcc[:, :max_frames]
+
+    return mfcc.flatten()
+
+
+def trim_leading_silence(audio: np.ndarray, threshold: float = 0.02) -> np.ndarray:
+    """Drop leading near-silence so speech starts at sample 0.
+
+    Training samples are zero-trimmed at generation time, so their MFCC frames
+    begin at the onset of speech. A live rolling buffer instead right-aligns
+    audio, which shifts every frame and makes the features unrecognizable to
+    the model — this realigns it.
+    """
+    loud = np.flatnonzero(np.abs(audio) >= threshold)
+    if loud.size == 0:
+        return audio
+    return audio[loud[0]:]
+
+
 def extract_mfcc_features(wav_path: str, n_mfcc: int = N_MFCC, max_frames: int = MAX_FRAMES) -> np.ndarray:
     """Extract fixed-length MFCC features from an audio file."""
     try:
-        y, sr = librosa.load(wav_path, sr=16000)
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-
-        if mfcc.shape[1] < max_frames:
-            mfcc = np.pad(mfcc, ((0, 0), (0, max_frames - mfcc.shape[1])), mode="constant")
-        else:
-            mfcc = mfcc[:, :max_frames]
-
-        return mfcc.flatten()
+        y, _sr = librosa.load(wav_path, sr=16000)
+        return mfcc_from_audio(y, n_mfcc, max_frames)
     except Exception as e:
         _LOGGER.warning(f"Error processing {wav_path}: {e}")
         return None
