@@ -78,6 +78,81 @@ This will do several things to each sample:
     * Change the acoustics of the sample to sound like the speaker was in a room with echo or using a poor quality microphone
 3. Resample to 16Khz for training (e.g., [openWakeWord][])
 
+## Wake Word Training Dataset (positive/negative variations)
+
+`--generate-variations` automatically generates phonetic variations of a wake
+word phrase and synthesizes TTS audio for each, split into `positive/` and
+`negative/` subdirectories:
+
+- **Positive**: minor phonetic differences (vowel/consonant confusion,
+  spacing/case) — acceptable as the "same" phrase
+- **Negative**: bigger changes (dropped words, confusable substitutions,
+  common alternate wake words, reversed word order) — must not trigger
+
+``` sh
+python3 -m piper_sample_generator 'hey limbo' \
+  --model models/en-us-libritts-high.pt \
+  --max-samples 500 \
+  --output-dir hey_limbo_dataset \
+  --generate-variations
+```
+
+Output:
+```
+hey_limbo_dataset/
+├── positive/   # e.g. "hey limbo", "hey rimbo", "hey lembo", ...
+└── negative/   # e.g. "hey nimbo", "hey", "hello limbo", ...
+```
+
+The variation generator is also available as a Python API:
+
+``` python
+from piper_sample_generator import generate_wakeword_variations
+
+positive, negative = generate_wakeword_variations("hey limbo")
+```
+
+### Full pipeline: generate → augment → train
+
+`--train-model` chains variation generation, augmentation, and training of a
+wake word detector into a single command:
+
+``` sh
+python3 -m piper_sample_generator 'hey limbo' \
+  --model models/en-us-libritts-high.pt \
+  --max-samples 2000 \
+  --batch-size 20 \
+  --output-dir hey_limbo_dataset \
+  --train-model \
+  --model-output wakeword_model.pkl
+```
+
+This trains a small MLP classifier over MFCC features with a **70/15/15
+train/val/test split**, early stopping, and checkpointing of the
+**best validation-loss** epoch (not just the final one). Useful flags:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--model-output` | `wakeword_model.pkl` | Where to save the trained model |
+| `--train-epochs` | 100 | Max training epochs |
+| `--train-patience` | 15 | Early-stopping patience (epochs without val-loss improvement) |
+
+Test a trained model on a single file:
+
+``` sh
+python3 test_wakeword.py wakeword_model.pkl some_audio.wav
+```
+
+Or evaluate accuracy over a whole directory:
+
+``` sh
+python3 eval_model_batch.py wakeword_model.pkl hey_limbo_dataset/positive_aug hey_limbo_dataset/negative_aug
+```
+
+Generation and training can also be run as separate steps — see
+`train_wakeword.py`, `piper_sample_generator/train.py`, and
+`piper_sample_generator.augment` for the underlying building blocks.
+
 
 <!-- Links -->
 [piper]: https://github.com/OHF-Voice/piper1-gpl/
