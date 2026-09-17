@@ -24,7 +24,7 @@ def evaluate(model_file: str, positive_dir: str, negative_dir: str, limit: int =
         correct = 0
         total = 0
         for wav in sorted(Path(directory).glob("*.wav"))[:limit]:
-            features = extract_mfcc_features(str(wav), data["n_mfcc"], data["max_frames"])
+            features = extract_mfcc_features(str(wav), data["n_mfcc"], data["n_bins"])
             if features is None:
                 continue
             x = torch.tensor(scaler.transform([features]), dtype=torch.float32)

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Union
 
 import numpy as np
-from audiomentations import ApplyImpulseResponse, Compose, Gain
+from audiomentations import AddGaussianSNR, ApplyImpulseResponse, Compose, Gain
 
 _DIR = Path(__file__).parent
 
@@ -21,6 +21,11 @@ def augment_directory(
         transforms=[
             Gain(min_gain_db=-12, max_gain_db=0),
             ApplyImpulseResponse(impulses),
+            # Real microphone audio always carries a noise floor, while TTS
+            # output is digitally silent between words. Without this, a model
+            # trained here keys on that unnatural silence and rejects live
+            # speech the moment any room noise is present.
+            AddGaussianSNR(min_snr_db=8.0, max_snr_db=40.0, p=1.0),
         ]
     )
 

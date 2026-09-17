@@ -11,23 +11,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from piper_sample_generator.train import WakeWordMLP
+from piper_sample_generator.train import WakeWordMLP, speech_features
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
-
-
-def extract_mfcc_features(wav_path: str, n_mfcc: int, max_frames: int) -> np.ndarray:
-    """Extract fixed-length MFCC features matching training preprocessing."""
-    y, sr = librosa.load(wav_path, sr=16000)
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-
-    if mfcc.shape[1] < max_frames:
-        mfcc = np.pad(mfcc, ((0, 0), (0, max_frames - mfcc.shape[1])), mode="constant")
-    else:
-        mfcc = mfcc[:, :max_frames]
-
-    return mfcc.flatten()
 
 
 def predict(model_file: str, audio_file: str) -> dict:
@@ -40,7 +27,8 @@ def predict(model_file: str, audio_file: str) -> dict:
     model.eval()
 
     try:
-        features = extract_mfcc_features(audio_file, data["n_mfcc"], data["max_frames"])
+        audio, _sr = librosa.load(audio_file, sr=16000)
+        features = speech_features(audio, data["n_mfcc"], data["n_bins"])
     except Exception as e:
         _LOGGER.error(f"Error loading audio: {e}")
         return None

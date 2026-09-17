@@ -17,13 +17,60 @@ from sklearn.preprocessing import StandardScaler
 _LOGGER = logging.getLogger(__name__)
 
 N_MFCC = 13
-MAX_FRAMES = 100
+MAX_FRAMES = 100  # retained for models trained before bin-pooled features
+N_BINS = 16
+
+
+def speech_features(
+    audio: np.ndarray, n_mfcc: int = N_MFCC, n_bins: int = N_BINS
+) -> np.ndarray:
+    """Duration-normalized, alignment-invariant MFCC features.
+
+    Trims to the speech region, then splits it into a fixed number of equal
+    time bins and takes mean+std of each MFCC coefficient per bin.
+
+    This replaces flat truncate/pad-to-N-frames features, which encoded clip
+    duration (training clips filled ~40 of 100 frames, the rest zero padding)
+    rather than the phrase, and shifted every value when the phrase moved
+    within the window. Binning makes the vector independent of duration,
+    onset position and speaking rate, so a live capture and a training clip
+    of the same phrase land in the same place.
+    """
+    audio = trim_silence(audio)
+
+    peak = float(np.abs(audio).max()) if audio.size else 0.0
+    if peak > 1e-6:
+        audio = audio / peak
+
+    if audio.size < 512:
+        return np.zeros(n_bins * n_mfcc * 2, dtype=np.float32)
+
+    mfcc = librosa.feature.mfcc(y=audio, sr=16000, n_mfcc=n_mfcc)
+
+    # Guarantee at least one frame per bin so no bin is empty.
+    if mfcc.shape[1] < n_bins:
+        mfcc = np.repeat(mfcc, int(np.ceil(n_bins / mfcc.shape[1])), axis=1)
+
+    parts = np.array_split(mfcc, n_bins, axis=1)
+    feats = [np.concatenate([p.mean(axis=1), p.std(axis=1)]) for p in parts]
+
+    return np.concatenate(feats).astype(np.float32)
 
 
 def mfcc_from_audio(
     audio: np.ndarray, n_mfcc: int = N_MFCC, max_frames: int = MAX_FRAMES
 ) -> np.ndarray:
-    """Extract fixed-length MFCC features from a 16kHz float32 waveform."""
+    """Extract fixed-length MFCC features from a 16kHz float32 waveform.
+
+    Peak-normalizes first so features describe spectral shape, not loudness.
+    Without this the model keys on absolute level (training clips are loud,
+    microphone input is quiet), and the same phrase scores 0.85 loud but 0.06
+    quiet. Normalizing here keeps training and inference in lockstep.
+    """
+    peak = float(np.abs(audio).max()) if audio.size else 0.0
+    if peak > 1e-6:
+        audio = audio / peak
+
     mfcc = librosa.feature.mfcc(y=audio, sr=16000, n_mfcc=n_mfcc)
 
     if mfcc.shape[1] < max_frames:
@@ -34,25 +81,115 @@ def mfcc_from_audio(
     return mfcc.flatten()
 
 
-def trim_leading_silence(audio: np.ndarray, threshold: float = 0.02) -> np.ndarray:
+def trim_leading_silence(audio: np.ndarray, threshold: float = 0.05) -> np.ndarray:
     """Drop leading near-silence so speech starts at sample 0.
 
     Training samples are zero-trimmed at generation time, so their MFCC frames
     begin at the onset of speech. A live rolling buffer instead right-aligns
     audio, which shifts every frame and makes the features unrecognizable to
     the model — this realigns it.
+
+    `threshold` is a fraction of the clip's own peak, not an absolute level:
+    an absolute cutoff picks the wrong onset on quiet input and misaligns
+    every frame.
     """
-    loud = np.flatnonzero(np.abs(audio) >= threshold)
+    if audio.size == 0:
+        return audio
+
+    peak = float(np.abs(audio).max())
+    if peak <= 1e-6:
+        return audio
+
+    loud = np.flatnonzero(np.abs(audio) >= threshold * peak)
     if loud.size == 0:
         return audio
     return audio[loud[0]:]
 
 
-def extract_mfcc_features(wav_path: str, n_mfcc: int = N_MFCC, max_frames: int = MAX_FRAMES) -> np.ndarray:
-    """Extract fixed-length MFCC features from an audio file."""
+def trim_silence(audio: np.ndarray, top_db: float = 15.0) -> np.ndarray:
+    """Trim to the speech region using short-time energy.
+
+    Uses frame energy in dB relative to peak rather than a raw sample
+    threshold: with a sample threshold, any noise floor above the cutoff
+    defeats trimming entirely, so a live window keeps its full 1.5s of noise
+    and the time bins get diluted instead of spanning just the phrase.
+    """
+    if audio.size < 512:
+        return audio
+
+    peak = float(np.abs(audio).max())
+    if peak <= 1e-6:
+        return audio
+
+    try:
+        trimmed, _ = librosa.effects.trim(audio, top_db=top_db)
+    except Exception:
+        return audio
+
+    return trimmed if trimmed.size >= 512 else audio
+
+
+def write_noise_negatives(output_dir, count: int = 300, seed: int = 0) -> int:
+    """Write noise/silence WAVs so the model learns to reject non-speech.
+
+    The generated dataset only contains spoken phrases, so a detector trained
+    on it has never seen "no one is talking" and will happily classify room
+    noise as a wake word.
+    """
+    import wave
+
+    rng = np.random.default_rng(seed)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(count):
+        duration = rng.uniform(0.6, 1.5)
+        n = int(duration * 16000)
+        kind = i % 3
+
+        if kind == 0:  # broadband noise
+            audio = rng.normal(0, rng.uniform(0.02, 0.3), n)
+        elif kind == 1:  # low-frequency rumble / hum
+            t = np.arange(n) / 16000
+            freq = rng.uniform(50, 260)
+            audio = rng.uniform(0.05, 0.3) * np.sin(2 * np.pi * freq * t)
+            audio += rng.normal(0, 0.02, n)
+        else:  # near-silence with a faint noise floor
+            audio = rng.normal(0, rng.uniform(0.0005, 0.01), n)
+
+        audio = np.clip(audio, -1.0, 1.0)
+        pcm = (audio * 32767.0).astype(np.int16)
+
+        with wave.open(str(output_dir / f"noise_{i}.wav"), "wb") as wav_file:
+            wav_file.setframerate(16000)
+            wav_file.setsampwidth(2)
+            wav_file.setnchannels(1)
+            wav_file.writeframes(pcm.tobytes())
+
+    return count
+
+
+def score_live_window(
+    audio: np.ndarray,
+    model: "WakeWordMLP",
+    scaler,
+    n_mfcc: int = N_MFCC,
+    n_bins: int = N_BINS,
+) -> float:
+    """Positive-class confidence for a live audio window."""
+    features = scaler.transform([speech_features(audio, n_mfcc, n_bins)])
+
+    with torch.no_grad():
+        probs = torch.softmax(model(torch.tensor(features, dtype=torch.float32)), dim=1)
+
+    return float(probs[0, 1].item())
+
+
+def extract_mfcc_features(wav_path: str, n_mfcc: int = N_MFCC, n_bins: int = N_BINS) -> np.ndarray:
+    """Extract features from an audio file, matching the live inference path."""
     try:
         y, _sr = librosa.load(wav_path, sr=16000)
-        return mfcc_from_audio(y, n_mfcc, max_frames)
+        return speech_features(y, n_mfcc, n_bins)
     except Exception as e:
         _LOGGER.warning(f"Error processing {wav_path}: {e}")
         return None
@@ -121,8 +258,15 @@ def train_model(
     patience: int = 15,
     lr: float = 1e-3,
     batch_size: int = 32,
+    noise_negatives: int = 300,
 ) -> bool:
     """Train MLP classifier with 70/15/15 split, checkpointing best val-loss model."""
+    if noise_negatives:
+        existing = len(list(Path(negative_dir).glob("noise_*.wav")))
+        if existing < noise_negatives:
+            _LOGGER.info(f"Adding {noise_negatives} noise/silence negatives")
+            write_noise_negatives(negative_dir, noise_negatives)
+
     _LOGGER.info("Loading dataset...")
     X, y = load_dataset(positive_dir, negative_dir)
 
@@ -150,7 +294,17 @@ def train_model(
 
     model = WakeWordMLP(input_dim=X.shape[1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    criterion = nn.CrossEntropyLoss()
+
+    # Negatives outnumber positives ~3:1 (each phrase yields more negative
+    # variations than positive ones, plus noise samples). Unweighted, the
+    # model stays biased toward "reject" and true positives score below 0.5
+    # even when they separate cleanly from negatives.
+    counts = np.bincount(y_train, minlength=2).astype(np.float64)
+    weights = torch.tensor(
+        (counts.sum() / (2.0 * np.maximum(counts, 1))), dtype=torch.float32, device=device
+    )
+    _LOGGER.info(f"Class weights: negative={weights[0]:.2f}, positive={weights[1]:.2f}")
+    criterion = nn.CrossEntropyLoss(weight=weights)
 
     best_val_loss = float("inf")
     best_state = None
@@ -231,7 +385,7 @@ def train_model(
                 "model_state_dict": best_state,
                 "input_dim": X.shape[1],
                 "n_mfcc": N_MFCC,
-                "max_frames": MAX_FRAMES,
+                "n_bins": N_BINS,
                 "scaler": scaler,
                 "best_epoch": best_epoch,
                 "best_val_loss": best_val_loss,

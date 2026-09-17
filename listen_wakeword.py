@@ -8,10 +8,8 @@ import time
 
 import numpy as np
 import sounddevice as sd
-import torch
-import torch.nn.functional as F
 
-from piper_sample_generator.train import WakeWordMLP, mfcc_from_audio, trim_leading_silence
+from piper_sample_generator.train import WakeWordMLP, score_live_window
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 _LOGGER = logging.getLogger(__name__)
@@ -29,18 +27,11 @@ def load_model(model_file: str):
     return model, data
 
 
-def predict(model, data, audio: np.ndarray) -> tuple:
-    """Return (label, confidence_positive, confidence_negative)."""
-    audio = trim_leading_silence(audio)
-    features = mfcc_from_audio(audio, data["n_mfcc"], data["max_frames"])
-    features = data["scaler"].transform([features])
-    x = torch.tensor(features, dtype=torch.float32)
-
-    with torch.no_grad():
-        probs = F.softmax(model(x), dim=1)[0]
-
-    label = int(torch.argmax(probs).item())
-    return label, probs[1].item(), probs[0].item()
+def predict(model, data, audio: np.ndarray) -> float:
+    """Return positive-class confidence for a live audio window."""
+    return score_live_window(
+        audio, model, data["scaler"], data["n_mfcc"], data["n_bins"]
+    )
 
 
 def listen(model_file: str, window_seconds: float, threshold: float, device: int = None):
@@ -81,12 +72,12 @@ def listen(model_file: str, window_seconds: float, threshold: float, device: int
                     _LOGGER.info("(listening, no audio detected yet...)")
                     continue
 
-                label, conf_pos, _conf_neg = predict(model, data, audio_buffer.copy())
+                confidence = predict(model, data, audio_buffer.copy())
 
-                if label == 1 and conf_pos >= threshold:
-                    _LOGGER.info(f"DETECTED  (confidence: {conf_pos:.3f})")
+                if confidence >= threshold:
+                    _LOGGER.info(f"DETECTED  (confidence: {confidence:.3f})")
                 else:
-                    _LOGGER.info(f"rejected  (confidence: {conf_pos:.3f})")
+                    _LOGGER.info(f"rejected  (confidence: {confidence:.3f})")
         except KeyboardInterrupt:
             _LOGGER.info("\nStopped.")
 

@@ -7,12 +7,10 @@ import pickle
 from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from piper_sample_generator.train import WakeWordMLP, mfcc_from_audio, trim_leading_silence
+from piper_sample_generator.train import WakeWordMLP, score_live_window
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
@@ -39,17 +37,15 @@ def load_model(model_file: str):
     return model, data
 
 
-def predict(audio: np.ndarray) -> tuple:
-    """Return (label, confidence_positive)."""
-    audio = trim_leading_silence(audio)
-    mfcc = mfcc_from_audio(audio, _MODEL_DATA["n_mfcc"], _MODEL_DATA["max_frames"])
-    features = _MODEL_DATA["scaler"].transform([mfcc])
-    x = torch.tensor(features, dtype=torch.float32)
-
-    with torch.no_grad():
-        probs = F.softmax(_MODEL(x), dim=1)[0]
-
-    return int(torch.argmax(probs).item()), probs[1].item()
+def predict(audio: np.ndarray) -> float:
+    """Return positive-class confidence for a live audio window."""
+    return score_live_window(
+        audio,
+        _MODEL,
+        _MODEL_DATA["scaler"],
+        _MODEL_DATA["n_mfcc"],
+        _MODEL_DATA["n_bins"],
+    )
 
 
 @app.get("/")
@@ -93,8 +89,8 @@ async def websocket_audio(websocket: WebSocket):
                 await websocket.send_json({"status": "silent", "confidence": 0.0, "peak": peak})
                 continue
 
-            label, confidence = predict(audio_buffer.copy())
-            detected = label == 1 and confidence >= _THRESHOLD
+            confidence = predict(audio_buffer.copy())
+            detected = confidence >= _THRESHOLD
 
             await websocket.send_json(
                 {
