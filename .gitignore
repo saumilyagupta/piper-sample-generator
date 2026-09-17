@@ -12,7 +12,8 @@ output/
 
 *.egg-info/
 *.pkl
-hey_limbo_dataset/
+hey_limbo_dataset*/
 integrated_demo/
 output_hey_limbo/
 training_demo/
+e2e_test_dataset/
