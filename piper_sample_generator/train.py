@@ -16,9 +16,9 @@ from sklearn.preprocessing import StandardScaler
 
 _LOGGER = logging.getLogger(__name__)
 
-N_MFCC = 13
+N_MFCC = 20
 MAX_FRAMES = 100  # retained for models trained before bin-pooled features
-N_BINS = 16
+N_BINS = 24
 
 
 def speech_features(
@@ -130,11 +130,12 @@ def trim_silence(audio: np.ndarray, top_db: float = 15.0) -> np.ndarray:
 
 
 def write_noise_negatives(output_dir, count: int = 300, seed: int = 0) -> int:
-    """Write noise/silence WAVs so the model learns to reject non-speech.
+    """Write varied non-speech WAVs so the model learns to reject them.
 
     The generated dataset only contains spoken phrases, so a detector trained
     on it has never seen "no one is talking" and will happily classify room
-    noise as a wake word.
+    noise as a wake word. Covers the sound types a microphone actually picks
+    up between utterances rather than white noise alone.
     """
     import wave
 
@@ -142,20 +143,56 @@ def write_noise_negatives(output_dir, count: int = 300, seed: int = 0) -> int:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    def broadband(n):
+        return rng.normal(0, rng.uniform(0.02, 0.3), n)
+
+    def hum(n):
+        """Mains hum / fan / HVAC: a low tone plus harmonics."""
+        t = np.arange(n) / 16000
+        base = rng.uniform(50, 120)
+        sig = np.sin(2 * np.pi * base * t)
+        for harmonic in (2, 3):
+            sig += rng.uniform(0.2, 0.6) * np.sin(2 * np.pi * base * harmonic * t)
+        return rng.uniform(0.05, 0.3) * sig + rng.normal(0, 0.01, n)
+
+    def near_silence(n):
+        return rng.normal(0, rng.uniform(0.0005, 0.01), n)
+
+    def babble(n):
+        """Speech-shaped noise: energy in the vocal band, no words."""
+        noise = rng.normal(0, 1, n)
+        spectrum = np.fft.rfft(noise)
+        freqs = np.fft.rfftfreq(n, 1 / 16000)
+        shape = np.exp(-((freqs - 500) ** 2) / (2 * 700 ** 2)) + 0.3
+        shaped = np.fft.irfft(spectrum * shape, n)
+        peak = np.abs(shaped).max()
+        return rng.uniform(0.05, 0.35) * shaped / (peak if peak > 1e-9 else 1.0)
+
+    def transients(n):
+        """Clicks, taps, keyboard: short bursts over a quiet floor."""
+        sig = rng.normal(0, 0.005, n)
+        for _ in range(rng.integers(2, 8)):
+            pos = rng.integers(0, max(1, n - 400))
+            length = rng.integers(40, 400)
+            burst = rng.normal(0, rng.uniform(0.1, 0.5), length)
+            burst *= np.exp(-np.linspace(0, 6, length))
+            sig[pos:pos + length] += burst
+        return sig
+
+    def sweep(n):
+        """Passing traffic / motor: a slowly gliding tone."""
+        t = np.arange(n) / 16000
+        f0, f1 = rng.uniform(80, 200), rng.uniform(200, 600)
+        freq = np.linspace(f0, f1, n)
+        phase = 2 * np.pi * np.cumsum(freq) / 16000
+        return rng.uniform(0.05, 0.25) * np.sin(phase) + rng.normal(0, 0.01, n)
+
+    kinds = [broadband, hum, near_silence, babble, transients, sweep]
+
     for i in range(count):
         duration = rng.uniform(0.6, 1.5)
         n = int(duration * 16000)
-        kind = i % 3
-
-        if kind == 0:  # broadband noise
-            audio = rng.normal(0, rng.uniform(0.02, 0.3), n)
-        elif kind == 1:  # low-frequency rumble / hum
-            t = np.arange(n) / 16000
-            freq = rng.uniform(50, 260)
-            audio = rng.uniform(0.05, 0.3) * np.sin(2 * np.pi * freq * t)
-            audio += rng.normal(0, 0.02, n)
-        else:  # near-silence with a faint noise floor
-            audio = rng.normal(0, rng.uniform(0.0005, 0.01), n)
+        audio = kinds[i % len(kinds)](n)
 
         audio = np.clip(audio, -1.0, 1.0)
         pcm = (audio * 32767.0).astype(np.int16)
@@ -223,16 +260,22 @@ def load_dataset(positive_dir: Union[str, Path], negative_dir: Union[str, Path])
 class WakeWordMLP(nn.Module):
     """Small feedforward classifier over MFCC features."""
 
-    def __init__(self, input_dim: int, hidden_dim: int = 128):
+    def __init__(self, input_dim: int, hidden_dim: int = 512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(hidden_dim // 2, 2),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.BatchNorm1d(hidden_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim // 4, 2),
         )
 
     def forward(self, x):

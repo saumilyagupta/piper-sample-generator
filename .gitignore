@@ -17,3 +17,7 @@ integrated_demo/
 output_hey_limbo/
 training_demo/
 e2e_test_dataset/
+hey_limbo_v2/
+hey_limbo_combined/
+*.log
+neg_phrases.txt

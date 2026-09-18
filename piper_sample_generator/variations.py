@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""Generate positive and negative wake word variations."""
+"""Generate wake word training phrases: the target phrase and its confusables."""
 
 from typing import List, Set, Tuple
 
 
 def generate_wakeword_variations(phrase: str) -> Tuple[List[str], List[str]]:
-    """Generate positive and negative variations of a wake word phrase.
+    """Split wake word training text into positives and negatives.
 
-    Positive: Minor phonetic differences (likely intended phrase)
-    Negative: More significant phonetic/structural changes
+    Positives are only renditions of the target phrase itself. Every phonetic
+    near-miss is a negative, because rejecting near-misses is precisely what a
+    wake word detector is for.
+
+    An earlier version split one-phoneme perturbations across both classes
+    ("hey rimbo" positive, "hey nimbo" negative). Those are equally distant
+    from the target, so the boundary existed only in the labels and not in the
+    audio, and accuracy collapsed once the samples came from varied voices.
 
     Args:
         phrase: Wake word phrase (e.g., "hey limbo")
 
     Returns:
-        Tuple of (positive_variations, negative_variations)
+        Tuple of (positive_phrases, negative_phrases)
 
     Raises:
-        ValueError: If phrase is empty or None
+        ValueError: If phrase is empty or has no words
     """
     if not phrase or not isinstance(phrase, str):
         raise ValueError("phrase must be a non-empty string")
@@ -28,151 +34,110 @@ def generate_wakeword_variations(phrase: str) -> Tuple[List[str], List[str]]:
     if not words:
         raise ValueError("phrase must contain at least one word")
 
-    positive: Set[str] = set()
+    positive: Set[str] = {phrase}
     negative: Set[str] = set()
 
-    # POSITIVE VARIATIONS - Minor phonetic differences
-    positive.add(phrase)
-    positive.add(phrase.upper())
-    positive.add(phrase.title())
-    positive.add("".join(words))  # Remove spaces
-    positive.add("  ".join(words))  # Extra spaces
+    # Spellings a text-to-speech engine pronounces the same way. They add no
+    # acoustic variety on their own, but they keep the positive set from being
+    # a single string, and cost nothing.
+    homophones = {
+        "o": ["ow", "oe"],
+        "i": ["y"],
+        "ee": ["ea"],
+        "c": ["k"],
+        "ph": ["f"],
+    }
 
-    # Vowel substitutions (minor)
-    vowel_variants = {
-        "a": ["aa", "e"],
-        "e": ["ee", "i"],
-        "i": ["ee", "e"],
-        "o": ["oo", "u"],
-        "u": ["oo", "o"],
+    for i, word in enumerate(words):
+        for src, replacements in homophones.items():
+            if word.endswith(src):
+                for repl in replacements:
+                    new_words = words.copy()
+                    new_words[i] = word[: -len(src)] + repl
+                    positive.add(" ".join(new_words))
+
+    # --- Negatives: everything the detector must not fire on ---
+
+    # Single-character substitutions: the hardest confusables.
+    substitutions = {
+        "a": "eou", "e": "aiou", "i": "aeou", "o": "aeiu", "u": "aeio",
+        "b": "pmdv", "p": "bft", "d": "tbg", "t": "dpk", "g": "kdj",
+        "k": "gtc", "m": "nbl", "n": "mlr", "l": "rnd", "r": "lwn",
+        "s": "zf", "z": "sv", "f": "vps", "v": "fbw", "w": "vr",
+        "h": "f", "j": "gy", "y": "ji", "c": "sk",
     }
 
     for i, word in enumerate(words):
         for pos, char in enumerate(word):
-            if char in vowel_variants:
-                for replacement in vowel_variants[char]:
-                    new_word = word[:pos] + replacement + word[pos + 1:]
-                    new_words = words.copy()
-                    new_words[i] = new_word
-                    positive.add(" ".join(new_words))
+            for repl in substitutions.get(char, ""):
+                new_words = words.copy()
+                new_words[i] = word[:pos] + repl + word[pos + 1:]
+                negative.add(" ".join(new_words))
 
-    # Consonant substitutions (minor - easily confused)
-    consonant_variants = {
-        "h": [""],
-        "l": ["r"],
-        "r": ["l"],
-        "m": ["n"],
-        "n": ["m"],
-        "b": ["p"],
-        "p": ["b"],
-        "d": ["t"],
-        "t": ["d"],
-    }
-
+    # Dropped and doubled characters.
     for i, word in enumerate(words):
-        for pos, char in enumerate(word):
-            if char in consonant_variants:
-                for replacement in consonant_variants[char]:
-                    new_word = word[:pos] + replacement + word[pos + 1:]
-                    new_words = words.copy()
-                    new_words[i] = new_word
-                    positive.add(" ".join(new_words))
+        if len(word) > 2:
+            for pos in range(len(word)):
+                new_words = words.copy()
+                new_words[i] = word[:pos] + word[pos + 1:]
+                negative.add(" ".join(new_words))
 
-    # Final vowel variations
-    for i, word in enumerate(words):
-        if word.endswith("o"):
+        for pos in range(len(word)):
             new_words = words.copy()
-            new_words[i] = word + "o"
-            positive.add(" ".join(new_words))
+            new_words[i] = word[:pos] + word[pos] + word[pos:]
+            negative.add(" ".join(new_words))
 
-    # NEGATIVE VARIATIONS - Significant changes
+    # Trailing and leading vowels.
+    for i, word in enumerate(words):
+        for char in "aeiou":
+            for candidate in (word + char, char + word):
+                new_words = words.copy()
+                new_words[i] = candidate
+                negative.add(" ".join(new_words))
 
-    # Partial phrases (remove words)
-    for i in range(len(words)):
-        negative.add(words[i])
+    # Partial phrases: each word alone, and the phrase minus one word.
+    for word in words:
+        negative.add(word)
 
     if len(words) > 1:
         negative.add(" ".join(words[:-1]))
         negative.add(" ".join(words[1:]))
+        negative.add(" ".join(reversed(words)))
 
-    # Change first word (common wake words)
-    first_word = words[0]
-    first_word_variants = [
-        "hi", "hello", "hay", "yo", "okay", "oh", "hey", "huh", "uh"
-    ]
-
-    for replacement in first_word_variants:
-        if replacement != first_word:
+    # A different leading word, plus unrelated wake words and filler.
+    alternates = ["hi", "hello", "hay", "yo", "okay", "oh", "huh", "uh", "the", "a"]
+    for replacement in alternates:
+        if replacement != words[0]:
             new_words = words.copy()
             new_words[0] = replacement
             negative.add(" ".join(new_words))
 
-    # Phonetic-near substitutions (more distant)
-    phonetic_subs = {
-        "l": ["n", "d"],
-        "r": ["n", "d"],
-        "m": ["b"],
-        "b": ["m", "p"],
-        "p": ["b"],
-        "i": ["a"],
-        "e": ["a"],
-        "o": ["a", "u"],
-        "a": ["u"],
-    }
+    negative.update([
+        "okay google", "hey google", "alexa", "hey siri", "computer",
+        "jarvis", "cortana", "hey assistant", "yes", "no", "stop", "play",
+        "what time is it", "turn on the lights", "thank you", "hello there",
+    ])
 
-    for i, word in enumerate(words):
-        for pos, char in enumerate(word):
-            if char in phonetic_subs:
-                for replacement in phonetic_subs[char]:
-                    new_word = word[:pos] + replacement + word[pos + 1:]
-                    new_words = words.copy()
-                    new_words[i] = new_word
-                    negative.add(" ".join(new_words))
-
-    # Remove/insert characters
-    for i, word in enumerate(words):
-        if len(word) > 2:
-            for pos in range(len(word)):
-                new_word = word[:pos] + word[pos + 1:]
-                new_words = words.copy()
-                new_words[i] = new_word
-                negative.add(" ".join(new_words))
-
-    # Add vowels
-    for i, word in enumerate(words):
-        for char in "aeiou":
-            new_word = word + char
-            new_words = words.copy()
-            new_words[i] = new_word
-            negative.add(" ".join(new_words))
-
-    # Word order reversal
-    if len(words) > 1:
-        negative.add(" ".join(reversed(words)))
-
-    # Remove positives from negatives
     negative -= positive
 
     return sorted(positive), sorted(negative)
 
 
 def main() -> None:
-    """Test variation generation."""
+    """Print the phrase split for a sample wake word."""
     phrase = "hey limbo"
     positive, negative = generate_wakeword_variations(phrase)
 
     print(f"Wake word: {phrase}\n")
-    print(f"POSITIVE VARIATIONS ({len(positive)}):")
-    for p in positive[:20]:
+    print(f"POSITIVE ({len(positive)}):")
+    for p in positive:
         print(f"  + {p}")
-    if len(positive) > 20:
-        print(f"  ... and {len(positive) - 20} more")
 
-    print(f"\nNEGATIVE VARIATIONS ({len(negative)}):")
-    for n in negative[:20]:
+    print(f"\nNEGATIVE ({len(negative)}):")
+    for n in negative[:30]:
         print(f"  - {n}")
-    if len(negative) > 20:
-        print(f"  ... and {len(negative) - 20} more")
+    if len(negative) > 30:
+        print(f"  ... and {len(negative) - 30} more")
 
 
 if __name__ == "__main__":
