@@ -3,28 +3,17 @@
 
 import argparse
 import logging
-import pickle
 import time
 
 import numpy as np
 import sounddevice as sd
 
-from piper_sample_generator.train import WakeWordCNN, score_live_window
+from piper_sample_generator.train import load_model, score_live_window
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 _LOGGER = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
-
-
-def load_model(model_file: str):
-    with open(model_file, "rb") as f:
-        data = pickle.load(f)
-
-    model = WakeWordCNN()
-    model.load_state_dict(data["model_state_dict"])
-    model.eval()
-    return model, data
 
 
 def predict(model, data, audio: np.ndarray) -> float:

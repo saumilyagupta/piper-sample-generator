@@ -3,15 +3,13 @@
 
 import argparse
 import logging
-import pickle
 from pathlib import Path
 
 import librosa
-import numpy as np
 import torch
 import torch.nn.functional as F
 
-from piper_sample_generator.train import WakeWordCNN, log_mel_spectrogram
+from piper_sample_generator.train import apply_norm, load_model, log_mel_spectrogram
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
@@ -19,12 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 def predict(model_file: str, audio_file: str) -> dict:
     """Predict if audio contains wake word."""
-    with open(model_file, "rb") as f:
-        data = pickle.load(f)
-
-    model = WakeWordCNN()
-    model.load_state_dict(data["model_state_dict"])
-    model.eval()
+    model, data = load_model(model_file)
 
     try:
         audio, _sr = librosa.load(audio_file, sr=16000)
@@ -33,8 +26,7 @@ def predict(model_file: str, audio_file: str) -> dict:
         _LOGGER.error(f"Error loading audio: {e}")
         return None
 
-    norm = data["norm"]
-    x = torch.tensor((spec - norm["mean"]) / norm["std"], dtype=torch.float32).unsqueeze(0)
+    x = torch.tensor(apply_norm(spec, data["norm"]), dtype=torch.float32).unsqueeze(0)
 
     with torch.no_grad():
         logits = model(x)

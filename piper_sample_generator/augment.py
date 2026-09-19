@@ -141,31 +141,29 @@ def augment_directory(
             assert input_wav_file.getnchannels() == 1
 
             input_rate = input_wav_file.getframerate()
-            input_audio = (
-                np.frombuffer(
-                    input_wav_file.readframes(input_wav_file.getnframes()),
-                    dtype=np.int16,
-                ).astype(np.float32)
-                / 32767.0
-            )
+            raw = input_wav_file.readframes(input_wav_file.getnframes())
+
+        # Resample to the target rate up front, so augmentation runs at one
+        # known rate. Augmenting at the input rate instead means a directory
+        # mixing engines -- Piper emits 22050 Hz, Deepgram 16000 -- runs the
+        # chain at two different rates, and the impulse responses get resampled
+        # on every single call to match whichever clip is in hand.
+        if input_rate != sample_rate:
+            raw, _state = audioop.ratecv(raw, 2, 1, input_rate, sample_rate, None)
+
+        input_audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
 
         for copy_index in range(copies):
             stem = input_wav.stem if copies == 1 else f"{input_wav.stem}_c{copy_index}"
             output_wav = output_dir / f"{stem}.wav"
 
-            output_audio = augment(input_audio, sample_rate=input_rate)
-            output_audio_16 = audio_float_to_int16(output_audio)
-
-            if sample_rate != input_rate:
-                output_audio_16, _state = audioop.ratecv(
-                    output_audio_16, 2, 1, input_rate, sample_rate, None
-                )
+            output_audio = augment(input_audio, sample_rate=sample_rate)
 
             with wave.open(str(output_wav), "wb") as output_wav_file:
-                output_wav_file.setframerate(sample_rate or input_rate)
+                output_wav_file.setframerate(sample_rate)
                 output_wav_file.setsampwidth(2)
                 output_wav_file.setnchannels(1)
-                output_wav_file.writeframes(output_audio_16)
+                output_wav_file.writeframes(audio_float_to_int16(output_audio))
 
 
 def audio_float_to_int16(

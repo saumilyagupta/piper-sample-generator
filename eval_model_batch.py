@@ -2,22 +2,16 @@
 """Batch-evaluate wake word model on directory of positive/negative samples."""
 
 import argparse
-import pickle
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from piper_sample_generator.train import WakeWordCNN, extract_features
+from piper_sample_generator.train import apply_norm, extract_features, load_model
 
 
 def evaluate(model_file: str, positive_dir: str, negative_dir: str, limit: int = 30):
-    with open(model_file, "rb") as f:
-        data = pickle.load(f)
-
-    model = WakeWordCNN()
-    model.load_state_dict(data["model_state_dict"])
-    model.eval()
+    model, data = load_model(model_file)
     norm = data["norm"]
 
     def predict_dir(directory, true_label):
@@ -27,8 +21,7 @@ def evaluate(model_file: str, positive_dir: str, negative_dir: str, limit: int =
             spec = extract_features(wav)
             if spec is None:
                 continue
-            x = torch.tensor((spec - norm["mean"]) / norm["std"],
-                             dtype=torch.float32).unsqueeze(0)
+            x = torch.tensor(apply_norm(spec, norm), dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 probs = F.softmax(model(x), dim=1)[0]
                 pred = int(torch.argmax(probs).item())

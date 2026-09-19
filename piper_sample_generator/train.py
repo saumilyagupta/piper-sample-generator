@@ -14,106 +14,52 @@ import logging
 import pickle
 import wave
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
-import librosa
 import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 
+from piper_sample_generator.features import (  # noqa: F401  (re-exported)
+    DB_FLOOR,
+    HOP_LENGTH,
+    N_FFT,
+    N_FRAMES,
+    N_MELS,
+    SAMPLE_RATE,
+    apply_norm,
+    compute_norm,
+    extract_features,
+    log_mel_spectrogram,
+)
+
 _LOGGER = logging.getLogger(__name__)
-
-SAMPLE_RATE = 16000
-N_MELS = 40
-N_FRAMES = 128          # ~1.28s at a 10ms hop
-N_FFT = 400             # 25ms window
-HOP_LENGTH = 160        # 10ms hop
-DB_FLOOR = -80.0
-
-
-def trim_silence(audio: np.ndarray, top_db: float = 15.0) -> np.ndarray:
-    """Trim to the speech region using short-time energy.
-
-    Uses frame energy in dB relative to peak rather than a raw sample
-    threshold: with a sample threshold, any noise floor above the cutoff
-    defeats trimming entirely, so a live window keeps its full buffer of noise.
-    """
-    if audio.size < 512:
-        return audio
-
-    if float(np.abs(audio).max()) <= 1e-6:
-        return audio
-
-    try:
-        trimmed, _ = librosa.effects.trim(audio, top_db=top_db)
-    except Exception:
-        return audio
-
-    return trimmed if trimmed.size >= 512 else audio
-
-
-def log_mel_spectrogram(audio: np.ndarray) -> np.ndarray:
-    """Fixed-size log-mel spectrogram for a 16kHz waveform.
-
-    Peak-normalizes so the features describe spectral shape rather than
-    loudness; training clips are loud while microphone input is quiet, and
-    without this the same phrase scores very differently at the two levels.
-    """
-    audio = trim_silence(audio)
-
-    peak = float(np.abs(audio).max()) if audio.size else 0.0
-    if peak > 1e-6:
-        audio = audio / peak
-
-    if audio.size < N_FFT:
-        audio = np.pad(audio, (0, N_FFT - audio.size))
-
-    mel = librosa.feature.melspectrogram(
-        y=audio,
-        sr=SAMPLE_RATE,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        n_mels=N_MELS,
-        fmin=20,
-        fmax=8000,
-    )
-    mel_db = librosa.power_to_db(mel, ref=np.max, top_db=-DB_FLOOR)
-
-    # Pad with the dB floor rather than zeros, so padding reads as silence
-    # instead of as full-scale energy.
-    if mel_db.shape[1] < N_FRAMES:
-        pad = N_FRAMES - mel_db.shape[1]
-        mel_db = np.pad(
-            mel_db, ((0, 0), (0, pad)), mode="constant", constant_values=DB_FLOOR
-        )
-    else:
-        mel_db = mel_db[:, :N_FRAMES]
-
-    return mel_db.astype(np.float32)
-
-
-def extract_features(wav_path: Union[str, Path]) -> Optional[np.ndarray]:
-    """Load a WAV and return its spectrogram, or None if unreadable."""
-    try:
-        audio, _sr = librosa.load(str(wav_path), sr=SAMPLE_RATE)
-        return log_mel_spectrogram(audio)
-    except Exception as e:
-        _LOGGER.warning(f"Error processing {wav_path}: {e}")
-        return None
 
 
 def load_dataset(
-    positive_dir: Union[str, Path], negative_dir: Union[str, Path]
+    positive_dir: Union[str, Path],
+    negative_dir: Union[str, Path],
+    pad_mode: str = "random",
+    seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Load spectrograms and labels from positive/negative directories."""
+    """Load spectrograms and labels from positive/negative directories.
+
+    pad_mode defaults to "random", placing each clip at a random offset within
+    the window. Nothing aligns the phrase at inference -- a live rolling buffer
+    catches it wherever it falls -- so training every clip flush to the start
+    would teach the model an alignment that never holds in practice. Each clip
+    is read once, so a clip and a shifted copy of itself cannot straddle the
+    train/test split.
+    """
+    rng = np.random.default_rng(seed)
     X, y = [], []
 
     for directory, label in ((positive_dir, 1), (negative_dir, 0)):
         kind = "positive" if label else "negative"
         _LOGGER.info(f"Loading {kind} samples from {directory}")
         for wav_file in sorted(Path(directory).glob("*.wav")):
-            features = extract_features(wav_file)
+            features = extract_features(wav_file, pad_mode=pad_mode, rng=rng)
             if features is not None:
                 X.append(features)
                 y.append(label)
@@ -167,6 +113,112 @@ class WakeWordCNN(nn.Module):
         return self.classifier(x)
 
 
+def _separable_block(in_ch: int, out_ch: int, pool: bool = True) -> nn.Sequential:
+    """Depthwise 3x3 followed by a pointwise 1x1, the MobileNet factorization.
+
+    A dense 3x3 conv costs in_ch * out_ch * 9 weights; splitting it costs
+    in_ch * 9 + in_ch * out_ch. At these widths that is roughly an eight-fold
+    reduction for a small accuracy cost, which is the trade a microcontroller
+    wants.
+    """
+    layers = [
+        nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, groups=in_ch, bias=False),
+        nn.BatchNorm2d(in_ch),
+        nn.ReLU(),
+        nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(),
+    ]
+    if pool:
+        layers.append(nn.MaxPool2d(2))
+    return nn.Sequential(*layers)
+
+
+class WakeWordCNNTiny(nn.Module):
+    """Wake word classifier sized for an ESP32-S3.
+
+    Two constraints drove the shape, and neither is the parameter count.
+
+    The first is peak activation. WakeWordCNN's opening conv produces
+    32x40x128, which is 640 KB in float32 and does not fit in the SRAM budget
+    however small the weights are. Striding the first conv by 2 in both axes
+    cuts that to 32x20x64 before anything else runs.
+
+    The second is that pooling the whole time axis into a single value, as
+    WakeWordCNN does with AdaptiveAvgPool2d(1), discards the order of what was
+    said. "limbo hey" and "hey limbo" contain the same sounds. The final pool
+    here collapses frequency completely but keeps time in four coarse bins, so
+    the ordering survives into the classifier. A fixed-kernel AvgPool2d is also
+    what exports cleanly; adaptive pooling does not.
+    """
+
+    def __init__(self, n_mels: int = N_MELS, n_frames: int = N_FRAMES):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+        )
+        self.blocks = nn.Sequential(
+            _separable_block(32, 32, pool=True),
+            _separable_block(32, 64, pool=True),
+            _separable_block(64, 64, pool=False),
+        )
+
+        # 40x128 -> stem 20x64 -> 10x32 -> 5x16, then pool frequency away and
+        # keep four time bins.
+        freq = n_mels // 8
+        time = n_frames // 8
+        self.time_bins = 4
+        self.pool = nn.AvgPool2d(kernel_size=(freq, time // self.time_bins))
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(64 * self.time_bins, 32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 2),
+        )
+
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.pool(x).flatten(1)
+        return self.classifier(x)
+
+
+ARCHITECTURES = {"cnn": WakeWordCNN, "tiny": WakeWordCNNTiny}
+
+
+def build_model(arch: str = "tiny") -> nn.Module:
+    """Instantiate an architecture by name."""
+    if arch not in ARCHITECTURES:
+        raise ValueError(f"Unknown architecture {arch!r}; expected one of "
+                         f"{sorted(ARCHITECTURES)}")
+    return ARCHITECTURES[arch]()
+
+
+def load_model(model_file: Union[str, Path]) -> Tuple[nn.Module, dict]:
+    """Load a trained model and its metadata from a .pkl file.
+
+    Models saved before the tiny architecture existed have no "architecture"
+    key and are always the original CNN.
+    """
+    with open(model_file, "rb") as f:
+        data = pickle.load(f)
+
+    model = build_model(data.get("architecture", "cnn"))
+    model.load_state_dict(data["model_state_dict"])
+    model.eval()
+    return model, data
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 def split_train_val_test(X: np.ndarray, y: np.ndarray, seed: int = 42) -> tuple:
     """70/15/15 train/val/test split (stratified)."""
     X_train, X_rest, y_train, y_rest = train_test_split(
@@ -178,10 +230,14 @@ def split_train_val_test(X: np.ndarray, y: np.ndarray, seed: int = 42) -> tuple:
     return X_train, y_train, X_val, y_val, X_test, y_test
 
 
-def score_live_window(audio: np.ndarray, model: WakeWordCNN, norm: dict) -> float:
-    """Positive-class confidence for a live audio window."""
-    spec = log_mel_spectrogram(audio)
-    spec = (spec - norm["mean"]) / norm["std"]
+def score_live_window(audio: np.ndarray, model: nn.Module, norm: dict) -> float:
+    """Positive-class confidence for a live audio window.
+
+    Reads the most recent N_FRAMES of the buffer, since a rolling buffer fills
+    from the right and the newest audio is what the caller is asking about.
+    """
+    spec = log_mel_spectrogram(audio, pad_mode="end")
+    spec = apply_norm(spec, norm)
     x = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
 
     model.eval()
@@ -270,6 +326,7 @@ def train_model(
     lr: float = 1e-3,
     batch_size: int = 64,
     noise_negatives: int = 300,
+    arch: str = "tiny",
 ) -> bool:
     """Train the CNN with a 70/15/15 split, keeping the best val-loss epoch."""
     if noise_negatives:
@@ -289,13 +346,11 @@ def train_model(
     X_train, y_train, X_val, y_val, X_test, y_test = split_train_val_test(X, y)
     _LOGGER.info(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
 
-    # Normalize using training statistics only.
-    mean = float(X_train.mean())
-    std = float(X_train.std()) or 1.0
-    norm = {"mean": mean, "std": std}
-    X_train = (X_train - mean) / std
-    X_val = (X_val - mean) / std
-    X_test = (X_test - mean) / std
+    # Normalize using training statistics only, per mel bin.
+    norm = compute_norm(X_train)
+    X_train = apply_norm(X_train, norm)
+    X_val = apply_norm(X_val, norm)
+    X_test = apply_norm(X_test, norm)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _LOGGER.info(f"Training on: {device}")
@@ -307,7 +362,8 @@ def train_model(
     X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
     y_test_t = torch.tensor(y_test, dtype=torch.long, device=device)
 
-    model = WakeWordCNN().to(device)
+    model = build_model(arch).to(device)
+    _LOGGER.info(f"Architecture: {arch} ({count_parameters(model):,} parameters)")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # Negatives outnumber positives, which biases the model toward "reject"
@@ -383,7 +439,7 @@ def train_model(
         pickle.dump(
             {
                 "model_state_dict": best_state,
-                "architecture": "cnn",
+                "architecture": arch,
                 "n_mels": N_MELS,
                 "n_frames": N_FRAMES,
                 "norm": norm,

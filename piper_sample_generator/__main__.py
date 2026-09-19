@@ -22,7 +22,7 @@ except ImportError:
     from piper_train.vits import commons
 
 from .augment import augment_directory
-from .train import train_model
+from .train import ARCHITECTURES, train_model
 from .variations import generate_wakeword_variations
 
 _LOGGER = logging.getLogger(__name__)
@@ -624,6 +624,13 @@ def main() -> int:
         default=15,
         help="Early stopping patience in epochs (best val-loss checkpoint is kept)",
     )
+    parser.add_argument(
+        "--arch",
+        default="tiny",
+        choices=sorted(ARCHITECTURES),
+        help="Model architecture. 'tiny' is sized for an ESP32-S3; 'cnn' is "
+             "the larger host-only model (default: tiny)",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args().__dict__
 
@@ -695,6 +702,7 @@ def main() -> int:
                 output_model=args["model_output"],
                 epochs=args["train_epochs"],
                 patience=args["train_patience"],
+                arch=args["arch"],
             )
             _LOGGER.info(f"✓ Trained model saved to: {args['model_output']}")
             return 0

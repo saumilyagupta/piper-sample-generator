@@ -3,14 +3,13 @@
 
 import argparse
 import logging
-import pickle
 from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from piper_sample_generator.train import WakeWordCNN, score_live_window
+from piper_sample_generator.train import load_model, score_live_window
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
@@ -25,16 +24,6 @@ _MODEL = None
 _MODEL_DATA = None
 _WINDOW_SECONDS = 1.5
 _THRESHOLD = 0.5
-
-
-def load_model(model_file: str):
-    with open(model_file, "rb") as f:
-        data = pickle.load(f)
-
-    model = WakeWordCNN()
-    model.load_state_dict(data["model_state_dict"])
-    model.eval()
-    return model, data
 
 
 def predict(audio: np.ndarray) -> float:
