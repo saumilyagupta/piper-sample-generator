@@ -21,3 +21,5 @@ hey_limbo_v2/
 hey_limbo_combined/
 *.log
 neg_phrases.txt
+impulses_resampled/
+_augprobe_*/
