@@ -10,7 +10,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
-from piper_sample_generator.train import WakeWordMLP, score_live_window
+from piper_sample_generator.train import WakeWordCNN, score_live_window
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ def load_model(model_file: str):
     with open(model_file, "rb") as f:
         data = pickle.load(f)
 
-    model = WakeWordMLP(input_dim=data["input_dim"])
+    model = WakeWordCNN()
     model.load_state_dict(data["model_state_dict"])
     model.eval()
     return model, data
@@ -39,13 +39,7 @@ def load_model(model_file: str):
 
 def predict(audio: np.ndarray) -> float:
     """Return positive-class confidence for a live audio window."""
-    return score_live_window(
-        audio,
-        _MODEL,
-        _MODEL_DATA["scaler"],
-        _MODEL_DATA["n_mfcc"],
-        _MODEL_DATA["n_bins"],
-    )
+    return score_live_window(audio, _MODEL, _MODEL_DATA["norm"])
 
 
 @app.get("/")

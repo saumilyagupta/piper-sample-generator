@@ -8,26 +8,27 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from piper_sample_generator.train import WakeWordMLP, extract_mfcc_features
+from piper_sample_generator.train import WakeWordCNN, extract_features
 
 
 def evaluate(model_file: str, positive_dir: str, negative_dir: str, limit: int = 30):
     with open(model_file, "rb") as f:
         data = pickle.load(f)
 
-    model = WakeWordMLP(input_dim=data["input_dim"])
+    model = WakeWordCNN()
     model.load_state_dict(data["model_state_dict"])
     model.eval()
-    scaler = data["scaler"]
+    norm = data["norm"]
 
     def predict_dir(directory, true_label):
         correct = 0
         total = 0
         for wav in sorted(Path(directory).glob("*.wav"))[:limit]:
-            features = extract_mfcc_features(str(wav), data["n_mfcc"], data["n_bins"])
-            if features is None:
+            spec = extract_features(wav)
+            if spec is None:
                 continue
-            x = torch.tensor(scaler.transform([features]), dtype=torch.float32)
+            x = torch.tensor((spec - norm["mean"]) / norm["std"],
+                             dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 probs = F.softmax(model(x), dim=1)[0]
                 pred = int(torch.argmax(probs).item())

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from piper_sample_generator.train import WakeWordMLP, speech_features
+from piper_sample_generator.train import WakeWordCNN, log_mel_spectrogram
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
@@ -22,19 +22,19 @@ def predict(model_file: str, audio_file: str) -> dict:
     with open(model_file, "rb") as f:
         data = pickle.load(f)
 
-    model = WakeWordMLP(input_dim=data["input_dim"])
+    model = WakeWordCNN()
     model.load_state_dict(data["model_state_dict"])
     model.eval()
 
     try:
         audio, _sr = librosa.load(audio_file, sr=16000)
-        features = speech_features(audio, data["n_mfcc"], data["n_bins"])
+        spec = log_mel_spectrogram(audio)
     except Exception as e:
         _LOGGER.error(f"Error loading audio: {e}")
         return None
 
-    features = data["scaler"].transform([features])
-    x = torch.tensor(features, dtype=torch.float32)
+    norm = data["norm"]
+    x = torch.tensor((spec - norm["mean"]) / norm["std"], dtype=torch.float32).unsqueeze(0)
 
     with torch.no_grad():
         logits = model(x)
