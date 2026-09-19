@@ -8,6 +8,26 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 # Written by analysis/probe_negative_separability.py --all.
 DEFAULT_SEPARABILITY_FILE = "neg_sims_temporal.json"
 
+# Similarity above which a negative is not worth training on.
+#
+# Calibrated against measured behaviour rather than chosen. A model trained
+# with every negative below the wake word's own self-similarity (0.9724) was
+# scored phrase by phrase with analysis/per_phrase_accuracy.py, and rejection
+# rate falls off a cliff at 0.93:
+#
+#     similarity      phrases     rejected correctly
+#     < 0.90             25              95.8%
+#     0.90 - 0.93        13              85.8%
+#     0.93 - 0.95         7              55.0%
+#     >= 0.95            22              52.3%
+#
+# Past 0.93 the model is at chance and its confidence sits at 0.50, which is
+# what a contradictory label looks like from the outside. Those phrases do not
+# merely fail to help; they drag the decision boundary and cost positive
+# recall. The proxy correlates -0.677 with measured rejection, so it ranks
+# phrases well while its absolute scale needs this calibration.
+SEPARABILITY_THRESHOLD = 0.93
+
 
 def _doubled_character_variants(words: List[str]) -> Set[str]:
     """Spellings that repeat a character, e.g. "hey limbo" -> "hey limmbo".
@@ -32,10 +52,10 @@ def load_separability(
 ) -> Optional[Tuple[Dict[str, float], float]]:
     """Load measured negative-phrase separability scores, if available.
 
-    Returns (scores, baseline) or None when no measurement file exists. The
-    baseline is the wake word's similarity to itself across different voices;
-    a negative scoring at or above it cannot be told apart from the wake word
-    by any model, so training on it only injects label noise.
+    Returns (scores, cutoff) or None when no measurement file exists. The
+    cutoff is the lower of SEPARABILITY_THRESHOLD and the wake word's own
+    self-similarity: a negative above either is one no model can separate from
+    the wake word, so training on it only injects label noise.
     """
     path = Path(path or DEFAULT_SEPARABILITY_FILE)
     if not path.exists():
@@ -46,7 +66,7 @@ def load_separability(
     baseline = data.get("baseline")
     if not sims or baseline is None:
         return None
-    return sims, float(baseline)
+    return sims, min(SEPARABILITY_THRESHOLD, float(baseline))
 
 
 def filter_negatives_by_separability(
@@ -60,8 +80,8 @@ def filter_negatives_by_separability(
     if separability is None:
         return negatives
 
-    sims, baseline = separability
-    return {n for n in negatives if sims.get(n, 0.0) < baseline}
+    sims, cutoff = separability
+    return {n for n in negatives if sims.get(n, 0.0) < cutoff}
 
 
 def generate_wakeword_variations(
@@ -83,10 +103,13 @@ def generate_wakeword_variations(
     synthetic, a negative is only worth training on if the text-to-speech
     engine actually renders it differently from the wake word. Two filters
     apply: doubled-character spellings are always dropped, and if measured
-    separability scores are available, anything at or above the wake word's own
-    self-similarity is dropped too. For "hey limbo" that removes 18 of 87
-    generated negatives -- including "hey linbo", "hey nimbo" and "hay limbo",
-    which are spelled differently but synthesized identically.
+    separability scores are available, anything at or above
+    SEPARABILITY_THRESHOLD is dropped too. For "hey limbo" that leaves 38 of
+    87 generated negatives. What survives is every phrase a listener would
+    actually distinguish -- rival wake words, partial phrases, different
+    leading words -- while single-character respellings such as "hey limba"
+    and "hey dimbo", which the synthesizer renders indistinguishably from the
+    wake word, are removed.
 
     Args:
         phrase: Wake word phrase (e.g., "hey limbo")

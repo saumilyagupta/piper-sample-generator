@@ -26,3 +26,9 @@ _augprobe_*/
 hey_limbo_v3/
 build_v3.log
 _smoke/
+hey_limbo_v4/
+build_v4.log
+augment_v3.log
+train_tiny.log
+wakeword_tiny.pkl
+export/build/

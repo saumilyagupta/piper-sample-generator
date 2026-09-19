@@ -135,8 +135,10 @@ def main() -> None:
         for engine, n in counts.items():
             if not n:
                 continue
-            # Round up, so the smaller engine reaches at least parity.
-            copies = max(1, -(-target // n))
+            # Round to nearest rather than up. Rounding up turns an engine
+            # already at 96% of the target into 2 copies and overshoots to
+            # nearly double, which reintroduces the imbalance being corrected.
+            copies = max(1, round(target / n))
             _LOGGER.info(f"Augmenting {n} {kind} {engine} clips x{copies} -> {dst}")
             augment_directory(out / f"{kind}_{engine}", dst,
                               sample_rate=SAMPLE_RATE, copies=copies)
