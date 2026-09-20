@@ -23,6 +23,8 @@ from sklearn.model_selection import train_test_split
 
 from piper_sample_generator.features import (  # noqa: F401  (re-exported)
     DB_FLOOR,
+    PAD_NOISE_MAX_DB,
+    PAD_NOISE_MIN_DB,
     HOP_LENGTH,
     N_FFT,
     N_FRAMES,
@@ -189,7 +191,60 @@ class WakeWordCNNTiny(nn.Module):
         return self.classifier(x)
 
 
-ARCHITECTURES = {"cnn": WakeWordCNN, "tiny": WakeWordCNNTiny}
+class WakeWordCNNSmall(nn.Module):
+    """A wider WakeWordCNNTiny, for when width rather than data is the limit.
+
+    Same depth, same stride-2 stem, same four-time-bin pool: the only change
+    is channel width, 32-64-96-128 against 32-32-64-64, plus a wider
+    classifier. Depthwise-separable blocks make that cheap, since widening
+    costs in_ch * out_ch in the pointwise convolution rather than nine times
+    that.
+
+    Peak activation is set by the stem and is therefore unchanged, which is
+    the constraint that actually decides whether this runs on an ESP32-S3.
+    The weights grow, and weights are the part that can live in flash.
+    """
+
+    def __init__(self, n_mels: int = N_MELS, n_frames: int = N_FRAMES):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+        )
+        self.blocks = nn.Sequential(
+            _separable_block(32, 64, pool=True),
+            _separable_block(64, 96, pool=True),
+            _separable_block(96, 128, pool=False),
+        )
+
+        freq = n_mels // 8
+        time = n_frames // 8
+        self.time_bins = 4
+        self.pool = nn.AvgPool2d(kernel_size=(freq, time // self.time_bins))
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(128 * self.time_bins, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.pool(x).flatten(1)
+        return self.classifier(x)
+
+
+ARCHITECTURES = {
+    "cnn": WakeWordCNN,
+    "tiny": WakeWordCNNTiny,
+    "small": WakeWordCNNSmall,
+}
 
 
 def build_model(arch: str = "tiny") -> nn.Module:
@@ -274,6 +329,17 @@ def write_noise_negatives(output_dir, count: int = 300, seed: int = 0) -> int:
     def near_silence(n):
         return rng.normal(0, rng.uniform(0.0005, 0.01), n)
 
+    def window_padding(n):
+        """The exact noise short clips are padded with, as a negative.
+
+        Without this the padding is only ever seen inside a positive window,
+        and since positives are shorter than negatives they carry more of it,
+        so its presence predicts the wake word. Drawing from the same range
+        here puts the identical audio on the other side of the boundary.
+        """
+        floor_db = rng.uniform(PAD_NOISE_MIN_DB, PAD_NOISE_MAX_DB)
+        return rng.normal(0, 10 ** (floor_db / 20), n)
+
     def babble(n):
         """Speech-shaped noise: energy in the vocal band, no words."""
         spectrum = np.fft.rfft(rng.normal(0, 1, n))
@@ -301,11 +367,43 @@ def write_noise_negatives(output_dir, count: int = 300, seed: int = 0) -> int:
         phase = 2 * np.pi * np.cumsum(freq) / SAMPLE_RATE
         return rng.uniform(0.05, 0.25) * np.sin(phase) + rng.normal(0, 0.01, n)
 
-    kinds = [broadband, hum, near_silence, babble, transients, sweep]
+    # window_padding appears twice: it is the one kind that has to outweigh
+    # its own appearance inside every positive window, rather than merely be
+    # represented among the sounds a microphone picks up.
+    def digital_silence(n):
+        """Exact zeros, which a muted or unplugged input delivers."""
+        return np.zeros(n)
+
+    kinds = [broadband, hum, near_silence, babble, transients, sweep,
+             window_padding, window_padding, digital_silence]
+
+    # Each kind is rescaled across a band spanning the padding levels.
+    #
+    # Measured, the kinds above land where their own amplitude constants put
+    # them: broadband, hum, babble and sweep all sit between -37 and -10 dBFS,
+    # entirely above the -65..-35 dB range short clips are padded with. So the
+    # padding band was covered by white noise alone, and the model still had
+    # room to read a quiet non-white room as speech. Rescaling keeps the
+    # timbres and makes every one of them cover the band that matters.
+    QUIET_DB, LOUD_DB = -72.0, -15.0
 
     for i in range(count):
-        n = int(rng.uniform(0.6, 1.5) * SAMPLE_RATE)
-        audio = np.clip(kinds[i % len(kinds)](n), -1.0, 1.0)
+        # Padding negatives fill the window outright, so that "the whole
+        # window is this noise" is itself a labelled example.
+        if kinds[i % len(kinds)] in (window_padding, digital_silence):
+            n = int(rng.uniform(1.3, 1.6) * SAMPLE_RATE)
+        else:
+            n = int(rng.uniform(0.6, 1.5) * SAMPLE_RATE)
+        kind = kinds[i % len(kinds)]
+        audio = kind(n)
+
+        if kind is not digital_silence:
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            if rms > 1e-9:
+                target = 10 ** (rng.uniform(QUIET_DB, LOUD_DB) / 20)
+                audio = audio * (target / rms)
+
+        audio = np.clip(audio, -1.0, 1.0)
         pcm = (audio * 32767.0).astype(np.int16)
 
         with wave.open(str(output_dir / f"noise_{i}.wav"), "wb") as wav_file:
@@ -325,7 +423,7 @@ def train_model(
     patience: int = 10,
     lr: float = 1e-3,
     batch_size: int = 64,
-    noise_negatives: int = 300,
+    noise_negatives: int = 1500,
     arch: str = "tiny",
 ) -> bool:
     """Train the CNN with a 70/15/15 split, keeping the best val-loss epoch."""
