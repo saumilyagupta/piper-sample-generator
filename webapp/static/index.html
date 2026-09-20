@@ -251,6 +251,13 @@
         <span id="peakConf">0.000</span>
       </div>
     </div>
+
+    <div class="meter-row">
+      <div class="meter-head">
+        <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted)">Lag behind microphone</span>
+        <span id="lagVal">—</span>
+      </div>
+    </div>
   </div>
 
   <div class="panel">
@@ -277,6 +284,7 @@ const els = {
   threshMark: document.getElementById('threshMark'),
   threshLabel: document.getElementById('threshLabel'),
   peakConf: document.getElementById('peakConf'),
+  lagVal: document.getElementById('lagVal'),
   modelInfo: document.getElementById('modelInfo'),
 };
 
@@ -284,7 +292,8 @@ let cfg = { sample_rate: 16000, window_seconds: 1.5, threshold: 0.5 };
 let running = false;
 let sessionPeak = 0;
 let ws = null, audioCtx = null, stream = null, processor = null, source = null;
-let pending = [];          // accumulated 16kHz samples awaiting send
+let pending = [];          // queue of Float32Array chunks awaiting send
+let pendingLength = 0;     // samples currently held in that queue
 // The model scores high only while the phrase sits near the right edge of the
 // window, so the send interval sets how finely that moment can be sampled.
 // At 0.5s the phrase frequently lands mid-window on every scoring instant and
@@ -339,6 +348,22 @@ function setState(state, verdict, note) {
   els.note.textContent = note;
 }
 
+/** Remove exactly `count` samples from the front of the pending queue. */
+function takeSamples(count) {
+  const out = new Float32Array(count);
+  let filled = 0;
+  while (filled < count) {
+    const head = pending[0];
+    const take = Math.min(head.length, count - filled);
+    out.set(head.subarray(0, take), filled);
+    filled += take;
+    if (take === head.length) pending.shift();
+    else pending[0] = head.subarray(take);
+  }
+  pendingLength -= count;
+  return out.buffer;
+}
+
 /** Linear-resample a Float32Array from inRate to outRate. */
 function resample(input, inRate, outRate) {
   if (inRate === outRate) return input;
@@ -386,6 +411,10 @@ async function start() {
       els.confFill.style.width = (c * 100).toFixed(1) + '%';
       els.confFill.classList.toggle('hit', msg.status === 'detected');
 
+      if (msg.lag_seconds !== undefined) {
+        els.lagVal.textContent = (msg.lag_seconds * 1000).toFixed(0) + ' ms';
+      }
+
       els.peakVal.textContent = p.toFixed(3);
       els.peakFill.style.width = Math.min(100, p * 200).toFixed(1) + '%';
 
@@ -408,16 +437,24 @@ async function start() {
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: cfg.sample_rate });
     source = audioCtx.createMediaStreamSource(stream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    // 4096 samples is 256 ms at 16 kHz, which the microphone cannot beat and
+    // which sets a floor under how quickly a result can appear. 1024 gives
+    // 64 ms and still leaves ample margin over the ~11 ms an inference costs.
+    processor = audioCtx.createScriptProcessor(1024, 1, 1);
 
     processor.onaudioprocess = (e) => {
       if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
 
       const chunk = resample(e.inputBuffer.getChannelData(0), audioCtx.sampleRate, cfg.sample_rate);
-      pending.push(...chunk);
+      pending.push(chunk);
+      pendingLength += chunk.length;
 
-      if (pending.length >= samplesPerSend) {
-        ws.send(new Float32Array(pending.splice(0, samplesPerSend)).buffer);
+      // Drain the whole backlog, not one message per callback. Sending a
+      // single 100 ms message per callback while the callback delivered more
+      // audio than that left the remainder queued, so the result on screen
+      // fell further behind the microphone the longer the session ran.
+      while (pendingLength >= samplesPerSend) {
+        ws.send(takeSamples(samplesPerSend));
       }
     };
 
@@ -438,8 +475,10 @@ async function start() {
 function stop() {
   running = false;
   pending = [];
+  pendingLength = 0;
   sessionPeak = 0;
   els.peakConf.textContent = '0.000';
+  els.lagVal.textContent = '—';
 
   if (processor) { processor.disconnect(); processor.onaudioprocess = null; processor = null; }
   if (source) { source.disconnect(); source = null; }

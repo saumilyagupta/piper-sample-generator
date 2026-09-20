@@ -64,6 +64,13 @@ async def websocket_audio(websocket: WebSocket):
     captured = [] if _DEBUG_DIR else None
     scores = [] if _DEBUG_DIR else None
 
+    # Audio received versus wall clock elapsed. If the client cannot hand over
+    # audio as fast as the microphone produces it, the backlog is invisible
+    # from either side and shows up only as a result that arrives late, so it
+    # is reported with every frame rather than left to be noticed.
+    started = None
+    samples_received = 0
+
     try:
         while True:
             raw = await websocket.receive_bytes()
@@ -71,6 +78,11 @@ async def websocket_audio(websocket: WebSocket):
 
             if len(chunk) == 0:
                 continue
+
+            if started is None:
+                started = time.monotonic()
+            samples_received += len(chunk)
+            lag = max(0.0, (time.monotonic() - started) - samples_received / SAMPLE_RATE)
 
             if captured is not None:
                 captured.append(chunk.copy())
@@ -85,7 +97,14 @@ async def websocket_audio(websocket: WebSocket):
             if peak < 1e-4:
                 if scores is not None:
                     scores.append((len(captured), 0.0, peak))
-                await websocket.send_json({"status": "silent", "confidence": 0.0, "peak": peak})
+                await websocket.send_json(
+                    {
+                        "status": "silent",
+                        "confidence": 0.0,
+                        "peak": peak,
+                        "lag_seconds": lag,
+                    }
+                )
                 continue
 
             confidence = predict(audio_buffer.copy())
@@ -99,10 +118,20 @@ async def websocket_audio(websocket: WebSocket):
                     "status": "detected" if detected else "rejected",
                     "confidence": confidence,
                     "peak": peak,
+                    "lag_seconds": lag,
                 }
             )
     except WebSocketDisconnect:
-        _LOGGER.info("Client disconnected")
+        if started is not None:
+            elapsed = time.monotonic() - started
+            audio_seconds = samples_received / SAMPLE_RATE
+            _LOGGER.info(
+                f"Client disconnected after {elapsed:.1f}s wall clock, "
+                f"{audio_seconds:.1f}s audio received "
+                f"(final lag {elapsed - audio_seconds:.2f}s)"
+            )
+        else:
+            _LOGGER.info("Client disconnected")
     finally:
         if captured:
             _write_capture(captured, scores)
