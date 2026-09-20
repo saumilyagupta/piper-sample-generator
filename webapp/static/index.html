@@ -244,6 +244,13 @@
       </div>
       <div class="track"><div class="fill level" id="peakFill"></div></div>
     </div>
+
+    <div class="meter-row">
+      <div class="meter-head">
+        <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted)">Session peak confidence</span>
+        <span id="peakConf">0.000</span>
+      </div>
+    </div>
   </div>
 
   <div class="panel">
@@ -269,21 +276,28 @@ const els = {
   peakFill: document.getElementById('peakFill'),
   threshMark: document.getElementById('threshMark'),
   threshLabel: document.getElementById('threshLabel'),
+  peakConf: document.getElementById('peakConf'),
   modelInfo: document.getElementById('modelInfo'),
 };
 
 let cfg = { sample_rate: 16000, window_seconds: 1.5, threshold: 0.5 };
 let running = false;
+let sessionPeak = 0;
 let ws = null, audioCtx = null, stream = null, processor = null, source = null;
 let pending = [];          // accumulated 16kHz samples awaiting send
-let samplesPerSend = 8000; // ~0.5s at 16kHz
+// The model scores high only while the phrase sits near the right edge of the
+// window, so the send interval sets how finely that moment can be sampled.
+// At 0.5s the phrase frequently lands mid-window on every scoring instant and
+// never scores above ~0.4; 0.1s samples the aligned moment reliably.
+const SEND_INTERVAL_SECONDS = 0.1;
+let samplesPerSend = 1600;
 
 async function init() {
   try {
     cfg = await (await fetch('/config')).json();
   } catch (e) { /* defaults are fine */ }
 
-  samplesPerSend = Math.round(cfg.sample_rate * 0.5);
+  samplesPerSend = Math.round(cfg.sample_rate * SEND_INTERVAL_SECONDS);
   els.threshMark.style.left = (cfg.threshold * 100) + '%';
   els.threshLabel.textContent = 'thr ' + cfg.threshold.toFixed(2);
   els.modelInfo.textContent =
@@ -347,7 +361,12 @@ async function start() {
   try {
     const deviceId = els.mic.value;
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: deviceId ? { exact: deviceId } : undefined }
+      audio: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        autoGainControl: false,
+        noiseSuppression: false,
+        echoCancellation: false,
+      }
     });
 
     ws = new WebSocket(`ws://${location.host}/ws`);
@@ -357,6 +376,11 @@ async function start() {
       const msg = JSON.parse(ev.data);
       const c = msg.confidence ?? 0;
       const p = msg.peak ?? 0;
+
+      if (c > sessionPeak) {
+        sessionPeak = c;
+        els.peakConf.textContent = sessionPeak.toFixed(3);
+      }
 
       els.confVal.textContent = c.toFixed(3);
       els.confFill.style.width = (c * 100).toFixed(1) + '%';
@@ -382,7 +406,7 @@ async function start() {
       setTimeout(() => rej(new Error('WebSocket connection timed out')), 5000);
     });
 
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: cfg.sample_rate });
     source = audioCtx.createMediaStreamSource(stream);
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
@@ -414,6 +438,8 @@ async function start() {
 function stop() {
   running = false;
   pending = [];
+  sessionPeak = 0;
+  els.peakConf.textContent = '0.000';
 
   if (processor) { processor.disconnect(); processor.onaudioprocess = null; processor = null; }
   if (source) { source.disconnect(); source = null; }

@@ -32,3 +32,8 @@ augment_v3.log
 train_tiny.log
 wakeword_tiny.pkl
 export/build/
+mic_debug/
+server_run.log
+wakeword_tiny_v5.pkl
+train_v5.py
+train_v5.log

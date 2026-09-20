@@ -44,6 +44,7 @@ N_MELS = 40
 N_FRAMES = 128          # ~1.28s at a 10ms hop
 N_FFT = 400             # 25ms window
 HOP_LENGTH = 160        # 10ms hop
+WINDOW_SAMPLES = N_FRAMES * HOP_LENGTH
 FMIN = 20
 FMAX = 8000
 
@@ -52,6 +53,19 @@ FMAX = 8000
 DB_REF = 1.0
 DB_FLOOR = -80.0
 DB_CEIL = 20.0
+
+# Level of the noise a short clip is padded with to fill a window.
+#
+# Padding used to be applied to the spectrogram at the dB floor, which splices
+# -80 dB digital silence onto every clip shorter than the window -- 58 of 60
+# measured Deepgram positives. No microphone produces -80 dB; a quiet room
+# measures around -45 dBFS. The gap matters because the model then has silence
+# available as evidence for the wake word, and because a running mean computed
+# over fake silence is not the running mean any live window produces.
+#
+# The range is randomized per clip so the floor itself cannot become a cue.
+PAD_NOISE_MIN_DB = -65.0
+PAD_NOISE_MAX_DB = -35.0
 
 PadMode = str  # "start" | "center" | "random" | "end"
 
@@ -136,6 +150,40 @@ def _fit_to_window(
     )
 
 
+def fit_audio_to_window(
+    audio: np.ndarray,
+    pad_mode: PadMode = "start",
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Pad audio to one full window with low-level noise, in the time domain.
+
+    Padding before the spectrogram rather than after it is what makes a padded
+    training window indistinguishable in kind from a live one: the filler goes
+    through the same mel filterbank and the same dB conversion as real room
+    noise would, instead of being written directly into the output at a level
+    no microphone can reach.
+    """
+    if len(audio) >= WINDOW_SAMPLES:
+        return audio
+
+    rng = rng or np.random.default_rng()
+    floor_db = float(rng.uniform(PAD_NOISE_MIN_DB, PAD_NOISE_MAX_DB))
+    buffer = rng.normal(0.0, 10 ** (floor_db / 20), WINDOW_SAMPLES).astype(np.float32)
+
+    room = WINDOW_SAMPLES - len(audio)
+    if pad_mode == "random":
+        left = int(rng.integers(0, room + 1))
+    elif pad_mode == "center":
+        left = room // 2
+    elif pad_mode == "end":
+        left = room
+    else:
+        left = 0
+
+    buffer[left:left + len(audio)] += audio
+    return buffer
+
+
 def extract_features(
     wav_path: Union[str, Path],
     pad_mode: PadMode = "start",
@@ -144,6 +192,7 @@ def extract_features(
     """Load a WAV and return its spectrogram, or None if unreadable."""
     try:
         audio, _sr = librosa.load(str(wav_path), sr=SAMPLE_RATE)
+        audio = fit_audio_to_window(audio, pad_mode=pad_mode, rng=rng)
         return log_mel_spectrogram(audio, pad_mode=pad_mode, rng=rng)
     except Exception as e:
         _LOGGER.warning(f"Error processing {wav_path}: {e}")
