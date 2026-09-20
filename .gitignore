@@ -52,3 +52,7 @@ train_v8.log
 wakeword_small_v9.pkl
 train_v9.py
 train_v9.log
+room_negatives/
+wakeword_tiny_v10.pkl
+train_v10.py
+train_v10.log
