@@ -37,3 +37,9 @@ server_run.log
 wakeword_tiny_v5.pkl
 train_v5.py
 train_v5.log
+wakeword_tiny_v6.pkl
+train_v6.py
+train_v6.log
+hey_limbo_v5/
+confusables/
+neg_phrases_v5.txt

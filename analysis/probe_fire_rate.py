@@ -24,6 +24,10 @@ HOP = int(0.1 * SAMPLE_RATE)
 
 
 def window_scores(audio, model, norm):
+    """Confidence for each window, or empty when the clip is shorter than one."""
+    if len(audio) < WINDOW:
+        return np.zeros(0)
+
     return np.array([
         score_live_window(audio[end - WINDOW:end].copy(), model, norm)
         for end in range(WINDOW, len(audio), HOP)
@@ -62,6 +66,9 @@ def main() -> None:
         for name, audio in captures.items():
             scores = window_scores(audio, model, norm)
             duration = len(audio) / SAMPLE_RATE
+            if not len(scores):
+                print(f"  {name}  {duration:5.1f}s  shorter than the window, skipped")
+                continue
             # 1.0 s refractory: longer than the phrase, shorter than a
             # plausible gap between two deliberate wake word utterances.
             events = detection_events(scores, args.threshold, refractory_windows=10)
