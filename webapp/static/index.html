@@ -309,6 +309,12 @@
     <input type="range" id="threshSlider" min="0" max="1" step="0.01" value="0.5">
 
     <div class="meter-head" style="margin-top:1rem">
+      <label for="runSlider" style="margin:0">Consecutive frames required</label>
+      <span id="runReadout" style="font-family:var(--mono)">1</span>
+    </div>
+    <input type="range" id="runSlider" min="1" max="8" step="1" value="1">
+
+    <div class="meter-head" style="margin-top:1rem">
       <label for="refractSlider" style="margin:0">Refractory period</label>
       <span id="refractReadout" style="font-family:var(--mono)">1.0 s</span>
     </div>
@@ -330,9 +336,13 @@
     </div>
 
     <p class="hint">
-      Both sliders re-score the whole session, so a recording can be swept
-      afterwards instead of repeated once per setting. Rate per hour is the
-      false-accept figure only while nothing is saying the wake word.
+      All three sliders re-score the whole session, so a recording can be
+      swept afterwards instead of repeated once per setting. Rate per hour is
+      the false-accept figure only while nothing is saying the wake word.
+      Requiring consecutive frames is usually a better trade than raising the
+      threshold: confidence across 36 dB of input level barely moves, so near
+      and far speech reach the same score, while a spurious match rarely holds
+      for several frames in a row.
     </p>
     <button id="resetBtn" style="background:var(--panel-hi);color:var(--text);border-color:var(--line)">Reset counters</button>
   </div>
@@ -364,6 +374,8 @@ const els = {
   lagVal: document.getElementById('lagVal'),
   threshSlider: document.getElementById('threshSlider'),
   threshReadout: document.getElementById('threshReadout'),
+  runSlider: document.getElementById('runSlider'),
+  runReadout: document.getElementById('runReadout'),
   refractSlider: document.getElementById('refractSlider'),
   refractReadout: document.getElementById('refractReadout'),
   detCount: document.getElementById('detCount'),
@@ -382,6 +394,8 @@ let sessionPeak = 0;
 let history = [];
 let threshold = 0.5;
 let refractorySeconds = 1.0;
+let minRun = 1;
+let liveRun = 0;
 let ws = null, audioCtx = null, stream = null, processor = null, source = null;
 let pending = [];          // queue of Float32Array chunks awaiting send
 let pendingLength = 0;     // samples currently held in that queue
@@ -447,10 +461,13 @@ function recount() {
 
   let detections = 0;
   let blockedUntil = -1;
+  let run = 0;
   for (let i = 0; i < history.length; i++) {
-    if (history[i] >= threshold && i > blockedUntil) {
+    run = history[i] >= threshold ? run + 1 : 0;
+    if (run >= minRun && i > blockedUntil) {
       detections++;
       blockedUntil = i + refractoryFrames;
+      run = 0;
     }
   }
 
@@ -546,10 +563,19 @@ async function start() {
       history.push(c);
 
       if (msg.status === 'silent') {
+        liveRun = 0;
         setState('listening', 'Listening…', 'no audio above noise floor');
       } else if (c >= threshold) {
-        setState('detected', 'DETECTED', `confidence ${c.toFixed(3)} ≥ ${threshold.toFixed(2)}`);
+        liveRun += 1;
+        if (liveRun >= minRun) {
+          setState('detected', 'DETECTED',
+            `confidence ${c.toFixed(3)} ≥ ${threshold.toFixed(2)} for ${liveRun} frames`);
+        } else {
+          setState('rejected', 'Holding…',
+            `${liveRun} of ${minRun} frames above ${threshold.toFixed(2)}`);
+        }
       } else {
+        liveRun = 0;
         setState('rejected', 'Rejected', `confidence ${c.toFixed(3)} < ${threshold.toFixed(2)}`);
       }
 
@@ -628,6 +654,12 @@ els.threshSlider.addEventListener('input', () => {
   recount();
 });
 
+els.runSlider.addEventListener('input', () => {
+  minRun = parseInt(els.runSlider.value, 10);
+  els.runReadout.textContent = String(minRun);
+  recount();
+});
+
 els.refractSlider.addEventListener('input', () => {
   refractorySeconds = parseFloat(els.refractSlider.value);
   els.refractReadout.textContent = refractorySeconds.toFixed(1) + ' s';
@@ -636,6 +668,7 @@ els.refractSlider.addEventListener('input', () => {
 
 els.resetBtn.addEventListener('click', () => {
   history = [];
+  liveRun = 0;
   sessionPeak = 0;
   els.peakConf.textContent = '0.000';
   recount();

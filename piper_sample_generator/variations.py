@@ -10,23 +10,41 @@ DEFAULT_SEPARABILITY_FILE = "neg_sims_temporal.json"
 
 # Similarity above which a negative is not worth training on.
 #
-# Calibrated against measured behaviour rather than chosen. A model trained
-# with every negative below the wake word's own self-similarity (0.9724) was
-# scored phrase by phrase with analysis/per_phrase_accuracy.py, and rejection
-# rate falls off a cliff at 0.93:
+# Set just below the wake word's own self-similarity, because that is the only
+# defensible bar: a phrase the synthesizer renders as indistinguishable from
+# the wake word carries a label its audio does not support, and a phrase that
+# renders differently is trainable however close it sounds to a listener.
 #
-#     similarity      phrases     rejected correctly
-#     < 0.90             25              95.8%
-#     0.90 - 0.93        13              85.8%
-#     0.93 - 0.95         7              55.0%
-#     >= 0.95            22              52.3%
+# An earlier 0.93 was derived from how often a trained model rejected each
+# phrase, which turned out to be circular -- rejection was measured on a model
+# whose training set had already dropped most of the rhyme class, so phrases
+# missing from training scored at chance and were excluded for it. Measuring
+# the audio directly, the whole "hey _imbo" class falls between 0.79 and 0.93
+# against a self-similarity of 0.961, and every member of it fires on a model
+# trained without it. They are confusables to reject, not noise to discard.
+SEPARABILITY_THRESHOLD = 0.96
+
+# Word onsets used to build rhyming confusables.
 #
-# Past 0.93 the model is at chance and its confidence sits at 0.50, which is
-# what a contradictory label looks like from the outside. Those phrases do not
-# merely fail to help; they drag the decision boundary and cost positive
-# recall. The proxy correlates -0.677 with measured rejection, so it ranks
-# phrases well while its absolute scale needs this calibration.
-SEPARABILITY_THRESHOLD = 0.93
+# A wake word is confusable mainly at the onset of its distinctive word: the
+# rhyme carries the rest. "hey limbo" competes with "hey bimbo", "hey simbo"
+# and "hey timbo", all of which a listener separates easily and none of which
+# the single-character substitution map produced -- it offered l -> r, n, d and
+# nothing else, so the class the detector most needs to reject was absent from
+# training entirely.
+#
+# Clusters are included because they are equally plausible mishearings and
+# cost nothing to synthesize. Several results are not words; that is not a
+# problem, because what matters is whether the audio differs from the wake
+# word, not whether the spelling means anything.
+ONSETS = (
+    "b", "bl", "br", "ch", "cl", "cr", "d", "dr", "f", "fl", "fr", "g", "gl",
+    "gr", "h", "j", "k", "kr", "m", "n", "p", "pl", "pr", "r", "s", "sh", "sk",
+    "sl", "sm", "sn", "sp", "st", "sw", "t", "th", "tr", "tw", "v", "w", "y",
+    "z",
+)
+
+VOWELS = "aeiou"
 
 
 def _doubled_character_variants(words: List[str]) -> Set[str]:
@@ -44,6 +62,41 @@ def _doubled_character_variants(words: List[str]) -> Set[str]:
             doubled = words.copy()
             doubled[i] = word[:pos] + word[pos] + word[pos:]
             variants.add(" ".join(doubled))
+    return variants
+
+
+def _onset_variants(word: str) -> Set[str]:
+    """Respellings of one word that keep its rhyme and change its onset.
+
+    The onset is taken to be the leading run of consonants, so "limbo" yields
+    "bimbo" and "strimbo" alike from the same rhyme "imbo". A word that opens
+    on a vowel has no onset to replace, in which case one is prepended.
+    """
+    split = 0
+    while split < len(word) and word[split] not in VOWELS:
+        split += 1
+
+    rhyme = word[split:]
+    if not rhyme:
+        return set()
+
+    return {onset + rhyme for onset in ONSETS} - {word}
+
+
+def _nucleus_variants(word: str) -> Set[str]:
+    """Respellings that change the stressed vowel and keep everything else.
+
+    These are the other half of the confusable space: "limbo" against "lambo"
+    and "lumbo". They are weaker confusables than onset swaps, since a vowel
+    carries less of the distinction, but they are the mistake a speaker of
+    another accent is most likely to produce.
+    """
+    variants = set()
+    for i, char in enumerate(word):
+        if char in VOWELS:
+            for vowel in VOWELS:
+                if vowel != char:
+                    variants.add(word[:i] + vowel + word[i + 1:])
     return variants
 
 
@@ -212,6 +265,14 @@ def generate_wakeword_variations(
         "jarvis", "cortana", "hey assistant", "yes", "no", "stop", "play",
         "what time is it", "turn on the lights", "thank you", "hello there",
     ])
+
+    # Rhyming confusables on the distinctive word, which for a phrase like
+    # "hey limbo" is the last one. Only that word is varied: the leading word
+    # is handled by `alternates` above, and swapping onsets there produces
+    # nothing a detector is at risk of confusing.
+    distinctive = words[-1]
+    for variant in _onset_variants(distinctive) | _nucleus_variants(distinctive):
+        negative.add(" ".join(words[:-1] + [variant]))
 
     negative -= positive
     negative -= _doubled_character_variants(words)
