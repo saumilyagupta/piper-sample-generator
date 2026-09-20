@@ -49,6 +49,7 @@ def detection_events(scores, threshold, refractory_windows):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("models", nargs="+")
+    parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
 
     captures = {Path(p).name: librosa.load(p, sr=SAMPLE_RATE)[0]
@@ -63,7 +64,7 @@ def main() -> None:
             duration = len(audio) / SAMPLE_RATE
             # 1.0 s refractory: longer than the phrase, shorter than a
             # plausible gap between two deliberate wake word utterances.
-            events = detection_events(scores, 0.5, refractory_windows=10)
+            events = detection_events(scores, args.threshold, refractory_windows=10)
             times = ", ".join(f"{i * HOP / SAMPLE_RATE + 1.5:.1f}s" for i in events)
             print(f"  {name}  {duration:5.1f}s  {len(scores):4d} windows  "
                   f"max {scores.max():.3f}  "

@@ -199,6 +199,47 @@
     margin-top: 0.35rem;
   }
 
+  input[type="range"] {
+    width: 100%;
+    margin: 0;
+    accent-color: var(--live);
+  }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.75rem;
+    margin-top: 1.1rem;
+  }
+
+  .stat {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 0.7rem 0.8rem;
+  }
+
+  .stat-label {
+    font-size: 0.64rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+
+  .stat-value {
+    margin-top: 0.3rem;
+    font-family: var(--mono);
+    font-size: 1.1rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .hint {
+    margin-top: 0.75rem;
+    font-size: 0.75rem;
+    line-height: 1.45;
+    color: var(--muted);
+  }
+
   .err {
     color: var(--miss);
     font-family: var(--mono);
@@ -261,6 +302,42 @@
   </div>
 
   <div class="panel">
+    <div class="meter-head">
+      <label for="threshSlider" style="margin:0">Detection threshold</label>
+      <span id="threshReadout" style="font-family:var(--mono)">0.50</span>
+    </div>
+    <input type="range" id="threshSlider" min="0" max="1" step="0.01" value="0.5">
+
+    <div class="meter-head" style="margin-top:1rem">
+      <label for="refractSlider" style="margin:0">Refractory period</label>
+      <span id="refractReadout" style="font-family:var(--mono)">1.0 s</span>
+    </div>
+    <input type="range" id="refractSlider" min="0.2" max="3" step="0.1" value="1.0">
+
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="stat-label">Detections</div>
+        <div class="stat-value" id="detCount">0</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Listened</div>
+        <div class="stat-value" id="listenTime">0.0s</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Rate / hour</div>
+        <div class="stat-value" id="detRate">&mdash;</div>
+      </div>
+    </div>
+
+    <p class="hint">
+      Both sliders re-score the whole session, so a recording can be swept
+      afterwards instead of repeated once per setting. Rate per hour is the
+      false-accept figure only while nothing is saying the wake word.
+    </p>
+    <button id="resetBtn" style="background:var(--panel-hi);color:var(--text);border-color:var(--line)">Reset counters</button>
+  </div>
+
+  <div class="panel">
     <label for="micSelect">Microphone</label>
     <select id="micSelect"><option>requesting permission…</option></select>
     <button id="toggleBtn" disabled>Start listening</button>
@@ -285,12 +362,26 @@ const els = {
   threshLabel: document.getElementById('threshLabel'),
   peakConf: document.getElementById('peakConf'),
   lagVal: document.getElementById('lagVal'),
+  threshSlider: document.getElementById('threshSlider'),
+  threshReadout: document.getElementById('threshReadout'),
+  refractSlider: document.getElementById('refractSlider'),
+  refractReadout: document.getElementById('refractReadout'),
+  detCount: document.getElementById('detCount'),
+  listenTime: document.getElementById('listenTime'),
+  detRate: document.getElementById('detRate'),
+  resetBtn: document.getElementById('resetBtn'),
   modelInfo: document.getElementById('modelInfo'),
 };
 
 let cfg = { sample_rate: 16000, window_seconds: 1.5, threshold: 0.5 };
 let running = false;
 let sessionPeak = 0;
+// Every scored frame of the session, so moving a slider can recount without
+// the phrase being spoken again. Ten frames a second puts an hour of
+// listening at roughly 36k entries, cheap against re-recording it.
+let history = [];
+let threshold = 0.5;
+let refractorySeconds = 1.0;
 let ws = null, audioCtx = null, stream = null, processor = null, source = null;
 let pending = [];          // queue of Float32Array chunks awaiting send
 let pendingLength = 0;     // samples currently held in that queue
@@ -307,10 +398,12 @@ async function init() {
   } catch (e) { /* defaults are fine */ }
 
   samplesPerSend = Math.round(cfg.sample_rate * SEND_INTERVAL_SECONDS);
-  els.threshMark.style.left = (cfg.threshold * 100) + '%';
-  els.threshLabel.textContent = 'thr ' + cfg.threshold.toFixed(2);
+  threshold = cfg.threshold;
+  els.threshSlider.value = String(threshold);
+  els.threshReadout.textContent = threshold.toFixed(2);
+  recount();
   els.modelInfo.textContent =
-    `${cfg.sample_rate} Hz · ${cfg.window_seconds}s window · threshold ${cfg.threshold}`;
+    `${cfg.sample_rate} Hz · ${cfg.window_seconds}s window`;
 
   await listMics();
 }
@@ -341,6 +434,36 @@ async function listMics() {
 }
 
 function setErr(msg) { els.err.textContent = msg || ''; }
+
+/** Recount detections over the whole session at the current slider settings.
+ *
+ * Frames arrive at a fixed interval, so a frame's index is its timestamp and
+ * no clock is needed. After a detection the next `refractorySeconds` are
+ * skipped: one spoken phrase stays inside the rolling window for several
+ * frames and would otherwise be counted once per frame.
+ */
+function recount() {
+  const refractoryFrames = Math.round(refractorySeconds / SEND_INTERVAL_SECONDS);
+
+  let detections = 0;
+  let blockedUntil = -1;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i] >= threshold && i > blockedUntil) {
+      detections++;
+      blockedUntil = i + refractoryFrames;
+    }
+  }
+
+  const listened = history.length * SEND_INTERVAL_SECONDS;
+  els.detCount.textContent = detections;
+  els.listenTime.textContent = listened.toFixed(1) + 's';
+  els.detRate.textContent = listened > 0
+    ? (detections / listened * 3600).toFixed(1)
+    : '—';
+
+  els.threshMark.style.left = (threshold * 100) + '%';
+  els.threshLabel.textContent = 'thr ' + threshold.toFixed(2);
+}
 
 function setState(state, verdict, note) {
   els.readout.dataset.state = state;
@@ -409,7 +532,7 @@ async function start() {
 
       els.confVal.textContent = c.toFixed(3);
       els.confFill.style.width = (c * 100).toFixed(1) + '%';
-      els.confFill.classList.toggle('hit', msg.status === 'detected');
+      els.confFill.classList.toggle('hit', c >= threshold);
 
       if (msg.lag_seconds !== undefined) {
         els.lagVal.textContent = (msg.lag_seconds * 1000).toFixed(0) + ' ms';
@@ -418,13 +541,19 @@ async function start() {
       els.peakVal.textContent = p.toFixed(3);
       els.peakFill.style.width = Math.min(100, p * 200).toFixed(1) + '%';
 
-      if (msg.status === 'detected') {
-        setState('detected', 'DETECTED', `confidence ${c.toFixed(3)} ≥ ${cfg.threshold}`);
-      } else if (msg.status === 'rejected') {
-        setState('rejected', 'Rejected', `confidence ${c.toFixed(3)} < ${cfg.threshold}`);
-      } else {
+      // The verdict is decided here rather than on the server, which is what
+      // lets the threshold move without restarting or re-recording.
+      history.push(c);
+
+      if (msg.status === 'silent') {
         setState('listening', 'Listening…', 'no audio above noise floor');
+      } else if (c >= threshold) {
+        setState('detected', 'DETECTED', `confidence ${c.toFixed(3)} ≥ ${threshold.toFixed(2)}`);
+      } else {
+        setState('rejected', 'Rejected', `confidence ${c.toFixed(3)} < ${threshold.toFixed(2)}`);
       }
+
+      recount();
     };
 
     ws.onerror = () => setErr('WebSocket error — is the server still running?');
@@ -477,7 +606,6 @@ function stop() {
   pending = [];
   pendingLength = 0;
   sessionPeak = 0;
-  els.peakConf.textContent = '0.000';
   els.lagVal.textContent = '—';
 
   if (processor) { processor.disconnect(); processor.onaudioprocess = null; processor = null; }
@@ -493,6 +621,25 @@ function stop() {
   els.peakFill.style.width = '0%';
   setState('idle', 'Idle', 'stopped');
 }
+
+els.threshSlider.addEventListener('input', () => {
+  threshold = parseFloat(els.threshSlider.value);
+  els.threshReadout.textContent = threshold.toFixed(2);
+  recount();
+});
+
+els.refractSlider.addEventListener('input', () => {
+  refractorySeconds = parseFloat(els.refractSlider.value);
+  els.refractReadout.textContent = refractorySeconds.toFixed(1) + ' s';
+  recount();
+});
+
+els.resetBtn.addEventListener('click', () => {
+  history = [];
+  sessionPeak = 0;
+  els.peakConf.textContent = '0.000';
+  recount();
+});
 
 els.btn.addEventListener('click', () => running ? stop() : start());
 init();
